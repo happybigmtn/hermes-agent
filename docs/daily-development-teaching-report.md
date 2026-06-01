@@ -18,9 +18,15 @@ the daily PDF teach in-flight supervised work in addition to landed commits.
 ```bash
 cd /srv/dev/repos/hermes-agent
 install -m 0755 scripts/hermes-daily-dev-report.py ~/.hermes/scripts/daily-dev-report.py
+install -m 0755 scripts/hermes-daily-mastery-check.py ~/.hermes/scripts/daily-mastery-check.py
 hermes cron create "0 13 * * *" \
   --name daily-dev-teaching-report \
   --script daily-dev-report.py \
+  --no-agent \
+  --deliver telegram
+hermes cron create "15 13 * * *" \
+  --name daily-dev-mastery-check \
+  --script daily-mastery-check.py \
   --no-agent \
   --deliver telegram
 ```
@@ -61,6 +67,12 @@ Hermes cron delivery strips that tag and sends the PDF as a native attachment.
 The summary includes the number of local orchestrator phase histories found in
 the reporting window.
 
+The mastery-check cron runs shortly after the PDF. It reads the latest
+`HUMAN-UNDERSTANDING-CHECKLIST.md` section, writes
+`daily-mastery-check-YYYYMMDD-HHMMSS.md`, syncs the latest prompt to gbrain page
+`development-mastery-check-latest`, and sends a Telegram prompt asking the human
+to answer each checklist item before the next broad orchestration run.
+
 ## Teaching Standard
 
 The report is written for comprehension, not status theater. For every active
@@ -76,6 +88,11 @@ repository it asks the human to understand:
 
 The checklist is deliberately persistent. Do not mark an item complete until the
 human can explain it in her own words.
+
+The mastery prompt is deliberately active. Its job is to stop the workflow from
+silently moving from "report generated" to "understanding achieved." The human
+should answer with concrete repos, branches, commits, artifacts, tests, and
+blockers.
 
 ## Manual Verification
 
