@@ -3,7 +3,7 @@
 
 Install into ~/.hermes/scripts/ and schedule with:
 
-hermes cron create "0 9 * * *" --name daily-dev-teaching-report --script daily-dev-report.py --no-agent --deliver telegram
+hermes cron create "0 13 * * *" --name daily-dev-teaching-report --script daily-dev-report.py --no-agent --deliver telegram
 """
 
 from hermes_cli.daily_dev_report import main
