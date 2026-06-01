@@ -8,6 +8,11 @@ This is intentionally a no-agent cron job. GitHub is the source of commit facts;
 the report generator turns those facts into a teaching surface without asking a
 model to remember or infer what landed.
 
+When local repo checkouts have `pilot-dev` phase artifacts, the report also
+includes orchestrator phase evidence from
+`.auto/orchestrator/*/phase-history.jsonl` or `phase-heartbeat.json`. This lets
+the daily PDF teach in-flight supervised work in addition to landed commits.
+
 ## Install On The Orchestrator
 
 ```bash
@@ -53,6 +58,8 @@ Each run writes:
 
 The cron stdout is a compact Telegram-ready summary ending with `MEDIA:<pdf>`.
 Hermes cron delivery strips that tag and sends the PDF as a native attachment.
+The summary includes the number of local orchestrator phase histories found in
+the reporting window.
 
 ## Teaching Standard
 
@@ -63,6 +70,8 @@ repository it asks the human to understand:
 - Branches: which branches carried the work.
 - Solution: why the resolution fits the codebase.
 - Edge cases: what tests, CI, or proof boundaries should protect the change.
+- Orchestrator: which phase artifacts prove active planning/execution/closeout
+  state, and what next operator action follows from them.
 - Context: what future work this enables or blocks.
 
 The checklist is deliberately persistent. Do not mark an item complete until the
