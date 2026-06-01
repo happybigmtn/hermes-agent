@@ -96,6 +96,7 @@ class RunSummary:
     active_processes: list[ProcessRecord] = field(default_factory=list)
     latest_run_artifact: ArtifactRecord | None = None
     latest_repo_artifact: ArtifactRecord | None = None
+    phase_heartbeat: dict[str, str] | None = None
     dirty_entries: list[str] = field(default_factory=list)
     execution_status: str | None = None
     closeout_status: str | None = None
@@ -110,6 +111,13 @@ class RunSummary:
         return bool(self.active_processes)
 
     def phase(self) -> str:
+        if self.phase_heartbeat:
+            phase = self.phase_heartbeat.get("phase", "").strip()
+            status = self.phase_heartbeat.get("status", "").strip()
+            if phase and status:
+                return f"{phase}: {status}"
+            if phase:
+                return phase
         labels: list[str] = []
         for process in self.active_processes:
             label = process.label()
@@ -403,6 +411,22 @@ def _read_json_status(path: Path, key: str = "status") -> str | None:
         return None
 
 
+def _read_phase_heartbeat(run_root: Path) -> dict[str, str] | None:
+    path = run_root / "phase-heartbeat.json"
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    phase = str(raw.get("phase") or "").strip()
+    if not phase:
+        return None
+    return {str(key): str(value) for key, value in raw.items() if value is not None}
+
+
 def _format_age(now: datetime, then: datetime | None) -> str:
     if then is None:
         return "unknown"
@@ -484,6 +508,7 @@ def collect_status(
             active_processes=active_processes,
             latest_run_artifact=latest_run_artifact,
             latest_repo_artifact=latest_repo_artifact,
+            phase_heartbeat=_read_phase_heartbeat(run_root),
             dirty_entries=_dirty_entries(repo_path),
             execution_status=_read_json_status(run_root / "pilot-execution.json"),
             closeout_status=_read_json_status(run_root / "pilot-closeout.json"),
@@ -535,6 +560,11 @@ def render_markdown(runs: Sequence[RunSummary], *, generated_at: datetime, stale
         )
         if run.attention_reason:
             lines.append(f"Attention reason: {run.attention_reason}")
+        if run.phase_heartbeat:
+            updated = run.phase_heartbeat.get("updated_at") or "unknown"
+            detail = run.phase_heartbeat.get("detail") or "none"
+            artifact = run.phase_heartbeat.get("artifact") or "none"
+            lines.append(f"Phase heartbeat: updated={updated}; detail={detail}; artifact=`{artifact}`")
         lines.append(f"Next action: {run.next_action}")
         lines.append("")
         if run.active_processes:

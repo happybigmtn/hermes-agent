@@ -9,6 +9,7 @@ from hermes_cli.dev_run_status import (
     collect_status,
     generate_status_report,
     parse_process_table,
+    render_markdown,
     telegram_summary,
 )
 
@@ -96,6 +97,53 @@ def test_collect_status_uses_repo_level_gen_artifacts(tmp_path):
     assert run.phase() == "planning: auto gen snapshot + Codex review"
     assert run.latest_artifact().path == plan
     assert run.implementation_plan == plan
+
+
+def test_collect_status_prefers_phase_heartbeat_over_process_guess(tmp_path):
+    repo_root = tmp_path / "repos"
+    repo = repo_root / "autonomy-bitino"
+    _init_repo(repo)
+    run_root = repo / ".auto" / "orchestrator" / "task012"
+    run_root.mkdir(parents=True)
+    (run_root / "run.env").write_text("RUN_ID=task012\nREPO_SLUG=autonomy-bitino\n", encoding="utf-8")
+    (run_root / "phase-heartbeat.json").write_text(
+        """\
+{
+  "artifact": "/tmp/corpus.log",
+  "detail": "auto corpus planning spine",
+  "phase": "corpus",
+  "status": "running",
+  "updated_at": "2026-06-01T23:10:22Z"
+}
+""",
+        encoding="utf-8",
+    )
+    processes = [
+        ProcessRecord(
+            pid=3,
+            ppid=2,
+            stat="Sl",
+            elapsed="00:04",
+            cpu=12.0,
+            mem=0.1,
+            command=f"codex exec --json --cd {repo}",
+        ),
+    ]
+
+    now = datetime(2026, 6, 1, 23, 12, tzinfo=timezone.utc)
+    runs = collect_status(
+        repo_roots=[repo_root],
+        now=now,
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        processes=processes,
+    )
+
+    assert len(runs) == 1
+    assert runs[0].phase() == "corpus: running"
+    markdown = render_markdown(runs, generated_at=now, stale_after=timedelta(minutes=30))
+    assert "Phase: corpus: running" in markdown
+    assert "Phase heartbeat: updated=2026-06-01T23:10:22Z" in markdown
 
 
 def test_collect_status_marks_stale_active_run(tmp_path):
