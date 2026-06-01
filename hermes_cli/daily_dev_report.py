@@ -86,6 +86,24 @@ class CommitRecord:
 
 
 @dataclass
+class OrchestratorPhaseRecord:
+    repo: str
+    run_id: str
+    run_root: Path
+    phases: list[str]
+    started_at: datetime | None
+    updated_at: datetime | None
+    latest_phase: str
+    latest_status: str
+    latest_detail: str
+    latest_artifact: str
+    entry_count: int
+
+    def phase_path(self) -> str:
+        return " -> ".join(self.phases) if self.phases else "unknown"
+
+
+@dataclass
 class ReportResult:
     markdown_path: Path
     pdf_path: Path
@@ -95,6 +113,7 @@ class ReportResult:
     commit_count: int
     repo_count: int
     repo_names: list[str]
+    orchestrator_run_count: int
     errors: list[str]
 
 
@@ -414,6 +433,137 @@ def _find_local_repo(full_name: str) -> Path | None:
     return None
 
 
+def collect_orchestrator_phase_runs(
+    repos: list[RepoRef],
+    *,
+    since: datetime,
+    until: datetime,
+) -> list[OrchestratorPhaseRecord]:
+    records: list[OrchestratorPhaseRecord] = []
+    for repo in repos:
+        local_repo = _find_local_repo(repo.full_name)
+        if local_repo is None:
+            continue
+        orchestrator_root = local_repo / ".auto" / "orchestrator"
+        if not orchestrator_root.is_dir():
+            continue
+        for run_root in sorted(orchestrator_root.iterdir()):
+            if not run_root.is_dir():
+                continue
+            record = _phase_record_from_run_root(
+                repo.full_name,
+                run_root,
+                since=since,
+                until=until,
+            )
+            if record is not None:
+                records.append(record)
+    records.sort(
+        key=lambda item: item.updated_at or item.started_at or datetime.fromtimestamp(0, tz=timezone.utc),
+        reverse=True,
+    )
+    return records
+
+
+def _phase_record_from_run_root(
+    repo: str,
+    run_root: Path,
+    *,
+    since: datetime,
+    until: datetime,
+) -> OrchestratorPhaseRecord | None:
+    entries = _read_phase_entries(run_root)
+    if not entries:
+        return None
+    dated_entries = [
+        (entry, parsed)
+        for entry in entries
+        if (parsed := _parse_phase_timestamp(str(entry.get("updated_at") or ""))) is not None
+    ]
+    if dated_entries:
+        first_seen = min(parsed for _, parsed in dated_entries)
+        last_seen = max(parsed for _, parsed in dated_entries)
+        if last_seen < since.astimezone(timezone.utc) or first_seen > until.astimezone(timezone.utc):
+            return None
+        latest_entry, latest_at = max(dated_entries, key=lambda item: item[1])
+    else:
+        stat = _safe_file_stat(run_root / "phase-history.jsonl") or _safe_file_stat(run_root / "phase-heartbeat.json")
+        if stat is None:
+            return None
+        observed = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        if observed < since.astimezone(timezone.utc) or observed > until.astimezone(timezone.utc):
+            return None
+        first_seen = observed
+        last_seen = observed
+        latest_entry = entries[-1]
+        latest_at = observed
+
+    phases: list[str] = []
+    for entry in entries:
+        phase = str(entry.get("phase") or "").strip()
+        if phase and phase not in phases:
+            phases.append(phase)
+    run_id = str(latest_entry.get("run_id") or run_root.name)
+    return OrchestratorPhaseRecord(
+        repo=repo,
+        run_id=run_id,
+        run_root=run_root,
+        phases=phases,
+        started_at=first_seen,
+        updated_at=latest_at or last_seen,
+        latest_phase=str(latest_entry.get("phase") or "unknown"),
+        latest_status=str(latest_entry.get("status") or "unknown"),
+        latest_detail=str(latest_entry.get("detail") or ""),
+        latest_artifact=str(latest_entry.get("artifact") or ""),
+        entry_count=len(entries),
+    )
+
+
+def _read_phase_entries(run_root: Path) -> list[dict[str, Any]]:
+    history = run_root / "phase-history.jsonl"
+    entries: list[dict[str, Any]] = []
+    if history.exists():
+        for raw in history.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                entries.append(parsed)
+    if entries:
+        return entries
+    heartbeat = run_root / "phase-heartbeat.json"
+    if not heartbeat.exists():
+        return []
+    try:
+        parsed = json.loads(heartbeat.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return []
+    return [parsed] if isinstance(parsed, dict) else []
+
+
+def _parse_phase_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _safe_file_stat(path: Path) -> os.stat_result | None:
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
 def _remote_text_matches(remote_text: str, full_name: str) -> bool:
     wanted = full_name.lower().removesuffix(".git")
     normalized = remote_text.lower().replace(":", "/")
@@ -642,6 +792,7 @@ def render_markdown(
     commits: list[CommitRecord],
     errors: list[str],
     *,
+    phase_runs: list[OrchestratorPhaseRecord] | None = None,
     repos_scanned: int,
     since: datetime,
     until: datetime,
@@ -652,6 +803,7 @@ def render_markdown(
     until_local = until.astimezone(local_tz)
     grouped = _group_by_repo(commits)
     repo_names = sorted(grouped)
+    phase_runs = phase_runs or []
 
     lines: list[str] = []
     lines.append(f"# Daily Development Teaching Report - {until_local:%Y-%m-%d}")
@@ -663,6 +815,7 @@ def render_markdown(
     lines.append(f"Repos scanned: {repos_scanned}")
     lines.append(f"Repos with commits: {len(repo_names)}")
     lines.append(f"Commits found: {len(commits)}")
+    lines.append(f"Orchestrator phase histories: {len(phase_runs)}")
     lines.append(f"Checklist: {checklist_path}")
     lines.append("")
     lines.append("## Executive Summary")
@@ -679,6 +832,15 @@ def render_markdown(
         for repo in repo_names:
             repo_commits = grouped[repo]
             lines.append(f"- {repo}: {len(repo_commits)} commit(s)")
+        if phase_runs:
+            lines.append("")
+            lines.append("Local orchestrator evidence:")
+            for run in phase_runs[:8]:
+                lines.append(
+                    f"- {run.repo}/{run.run_id}: "
+                    f"{run.latest_phase}:{run.latest_status} "
+                    f"after {run.entry_count} phase event(s)"
+                )
     else:
         lines.append(
             "No GitHub commits were found in this window. That is still useful: "
@@ -696,6 +858,9 @@ def render_markdown(
         "understanding checks."
     )
     lines.append("")
+
+    if phase_runs:
+        lines.extend(_orchestrator_phase_section(phase_runs, local_tz=local_tz))
 
     for repo in repo_names:
         repo_commits = grouped[repo]
@@ -747,14 +912,17 @@ def render_markdown(
     lines.append("- [ ] Branches: I can name which branches carried the work.")
     lines.append("- [ ] Solution: I can explain why this resolution fits the codebase.")
     lines.append("- [ ] Edge cases: I can name the tests or checks that should protect it.")
+    lines.append("- [ ] Orchestrator: I can connect run phases to commits, artifacts, or blockers.")
     lines.append("- [ ] Context: I can explain what this will impact next.")
     lines.append("")
     lines.append("## Source Of Truth")
     lines.append("")
     lines.append(
-        "Commit inventory came from GitHub branch refs and commit APIs, not from "
-        "local clones. This is what lets the report include commits whether or "
-        "not Hermes orchestrated them."
+        "Commit inventory came from GitHub branch refs, local clones that match "
+        "GitHub remotes, and commit APIs. Orchestrator phase evidence came from "
+        "local `.auto/orchestrator/*/phase-history.jsonl` or `phase-heartbeat.json` "
+        "artifacts. Together these sources let the report include both landed "
+        "commits and in-flight supervised work."
     )
     lines.append("")
     return "\n".join(lines)
@@ -765,6 +933,47 @@ def _group_by_repo(commits: list[CommitRecord]) -> dict[str, list[CommitRecord]]
     for commit in commits:
         grouped.setdefault(commit.repo, []).append(commit)
     return grouped
+
+
+def _orchestrator_phase_section(
+    phase_runs: list[OrchestratorPhaseRecord],
+    *,
+    local_tz: timezone,
+) -> list[str]:
+    lines: list[str] = []
+    lines.append("## Orchestrator Phase Evidence")
+    lines.append("")
+    lines.append(
+        "These entries come from local run-root heartbeat artifacts. They explain "
+        "what Hermes/autodev/Codex were doing between commits, so the human can "
+        "distinguish landed work from active planning, execution, closeout, or blockers."
+    )
+    lines.append("")
+    for run in phase_runs[:12]:
+        updated = (
+            run.updated_at.astimezone(local_tz).strftime("%Y-%m-%d %H:%M %Z")
+            if run.updated_at
+            else "unknown"
+        )
+        lines.append(f"### {run.repo} / {run.run_id}")
+        lines.append("")
+        lines.append(f"- Latest phase: `{run.latest_phase}: {run.latest_status}`")
+        lines.append(f"- Phase path: {run.phase_path()}")
+        lines.append(f"- Last heartbeat: {updated}")
+        lines.append(f"- Run root: `{run.run_root}`")
+        if run.latest_detail:
+            lines.append(f"- Detail: {run.latest_detail}")
+        if run.latest_artifact:
+            lines.append(f"- Artifact: `{run.latest_artifact}`")
+        lines.append(
+            "- Teaching prompt: explain what this phase was supposed to prove, "
+            "which artifact confirms progress, and what the next operator action should be."
+        )
+        lines.append("")
+    if len(phase_runs) > 12:
+        lines.append(f"- plus {len(phase_runs) - 12} more orchestrator run(s)")
+        lines.append("")
+    return lines
 
 
 def _repo_teaching_section(repo: str, commits: list[CommitRecord]) -> list[str]:
@@ -899,6 +1108,7 @@ def update_checklist(
     checklist_path: Path,
     commits: list[CommitRecord],
     *,
+    phase_runs: list[OrchestratorPhaseRecord] | None = None,
     report_markdown: Path,
     report_pdf: Path,
     since: datetime,
@@ -919,6 +1129,7 @@ def update_checklist(
     until_local = until.astimezone(local_tz)
     repos = sorted({commit.repo for commit in commits})
     repo_text = ", ".join(repos) if repos else "none"
+    phase_runs = phase_runs or []
     section = [
         f"## {until_local:%Y-%m-%d %H:%M %Z} Report",
         "",
@@ -927,11 +1138,13 @@ def update_checklist(
         f"PDF: {report_pdf}",
         f"Repos: {repo_text}",
         f"Commits: {len(commits)}",
+        f"Orchestrator phases: {len(phase_runs)}",
         "",
         "- [ ] Problem: she can explain what changed and why the prior state was insufficient.",
         "- [ ] Branches: she can name the branches and whether work came from Hermes or elsewhere.",
         "- [ ] Solution: she can explain the design decisions and why this approach fits.",
         "- [ ] Edge cases: she can name validation, missing tests, and risk boundaries.",
+        "- [ ] Orchestrator: she can connect phase history to artifacts, commits, blockers, or next action.",
         "- [ ] Context: she can explain what downstream work this enables or blocks.",
         "",
     ]
@@ -1127,6 +1340,7 @@ def generate_report(
     )
     repos_to_scan = repos if explicit_repos else [repo for repo in repos if _repo_updated_in_window(repo, since)]
     commits, errors = collect_commits(client, repos_to_scan, since=since, until=until)
+    phase_runs = collect_orchestrator_phase_runs(repos_to_scan, since=since, until=until)
     report_dir.mkdir(parents=True, exist_ok=True)
     stamp = until.astimezone(local_tz).strftime("%Y%m%d-%H%M%S")
     markdown_path = report_dir / f"daily-dev-report-{stamp}.md"
@@ -1135,6 +1349,7 @@ def generate_report(
     markdown = render_markdown(
         commits,
         errors,
+        phase_runs=phase_runs,
         repos_scanned=len(repos_to_scan),
         since=since,
         until=until,
@@ -1149,6 +1364,7 @@ def generate_report(
     update_checklist(
         checklist_path,
         commits,
+        phase_runs=phase_runs,
         report_markdown=markdown_path,
         report_pdf=pdf_path,
         since=since,
@@ -1170,6 +1386,7 @@ def generate_report(
         commit_count=len(commits),
         repo_count=len(repos_to_scan),
         repo_names=sorted({commit.repo for commit in commits}),
+        orchestrator_run_count=len(phase_runs),
         errors=errors,
     )
 
@@ -1183,6 +1400,7 @@ def telegram_summary(result: ReportResult) -> str:
         f"Repos scanned: {result.repo_count}",
         f"Repos with commits: {repo_text}",
         f"Commits: {result.commit_count}",
+        f"Orchestrator runs: {result.orchestrator_run_count}",
         f"Markdown: {result.markdown_path}",
         f"PDF: {result.pdf_path}",
         f"Checklist: {result.checklist_path}",

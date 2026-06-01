@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import subprocess
 
 from hermes_cli.daily_dev_report import (
@@ -122,6 +123,72 @@ def test_generate_report_writes_markdown_pdf_and_checklist(tmp_path):
     summary = telegram_summary(result)
     assert "Daily development teaching report ready." in summary
     assert f"MEDIA:{result.pdf_path}" in summary
+
+
+def test_generate_report_includes_orchestrator_phase_history(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repos"
+    repo = repo_root / "demo"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "r@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "R"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:octo/demo.git"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "README.md").write_text("demo\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    env = {
+        "GIT_AUTHOR_DATE": "2026-06-01T12:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2026-06-01T12:00:00+00:00",
+    }
+    subprocess.run(
+        ["git", "commit", "-m", "feat(orchestrator): prove phase reporting"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env={**os.environ, **env},
+    )
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", head], cwd=repo, check=True)
+    run_root = repo / ".auto" / "orchestrator" / "run1"
+    run_root.mkdir(parents=True)
+    (run_root / "phase-history.jsonl").write_text(
+        "\n".join(
+            [
+                '{"artifact": "/tmp/run.env", "detail": "pilot-dev initialized", "phase": "initialized", "repo": "octo/demo", "run_id": "run1", "status": "running", "updated_at": "2026-06-01T11:00:00Z"}',
+                '{"artifact": "/tmp/gen.log", "detail": "auto gen --snapshot-only", "phase": "gen", "repo": "octo/demo", "run_id": "run1", "status": "running", "updated_at": "2026-06-01T12:00:00Z"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_DAILY_REPORT_REPO_ROOTS", str(repo_root))
+
+    result = generate_report(
+        client=FakeClient(),
+        owner="octo",
+        explicit_repos=["octo/demo"],
+        include_archived=False,
+        since=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
+        until=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
+        report_dir=tmp_path / "reports",
+        local_tz=timezone.utc,
+        write_pdf=False,
+        write_gbrain=False,
+    )
+
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+    checklist = result.checklist_path.read_text(encoding="utf-8")
+    assert result.orchestrator_run_count == 1
+    assert "## Orchestrator Phase Evidence" in markdown
+    assert "octo/demo / run1" in markdown
+    assert "initialized -> gen" in markdown
+    assert "`gen: running`" in markdown
+    assert "Orchestrator phases: 1" in checklist
+    assert "she can connect phase history" in checklist
+    assert "Orchestrator runs: 1" in telegram_summary(result)
 
 
 def test_commit_kind_and_test_detection():
