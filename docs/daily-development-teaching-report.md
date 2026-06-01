@@ -1,0 +1,82 @@
+# Daily Development Teaching Report
+
+Hermes can run a deterministic daily report that inventories GitHub commits,
+builds a teaching artifact, writes a PDF, updates a running human-understanding
+checklist, and sends a Telegram-ready message with the PDF attached.
+
+This is intentionally a no-agent cron job. GitHub is the source of commit facts;
+the report generator turns those facts into a teaching surface without asking a
+model to remember or infer what landed.
+
+## Install On The Orchestrator
+
+```bash
+cd /srv/dev/repos/hermes-agent
+install -m 0755 scripts/hermes-daily-dev-report.py ~/.hermes/scripts/daily-dev-report.py
+hermes cron create "0 13 * * *" \
+  --name daily-dev-teaching-report \
+  --script daily-dev-report.py \
+  --no-agent \
+  --deliver telegram
+```
+
+The script uses `gh auth token`, so the machine running the job must already be
+authenticated with GitHub.
+
+## Configuration
+
+Environment variables read by the script:
+
+- `HERMES_DAILY_REPORT_OWNER`: GitHub user or org to scan.
+- `HERMES_DAILY_REPORT_REPOS`: comma-separated `owner/repo` allowlist.
+- `HERMES_DAILY_REPORT_LOOKBACK_HOURS`: default `24`.
+- `HERMES_DAILY_REPORT_TIMEZONE`: default `America/New_York`.
+- `HERMES_DAILY_REPORT_DIR`: default `~/.hermes/reports`.
+- `HERMES_DAILY_REPORT_REPO_ROOTS`: comma-separated roots for local clones; default `/srv/dev/repos`, `~/coding`, and `~/Coding`.
+- `GH_TOKEN` or `GITHUB_TOKEN`: optional explicit GitHub token override.
+
+Without an owner or repo allowlist, the script scans repositories visible to the
+authenticated GitHub account via `/user/repos`. Owner scans first filter to repos
+updated during the report window, then prefer matching local clones so all refs
+from the repo's own GitHub remote can be included without scanning every remote
+repository branch one by one.
+
+## Output Contract
+
+Each run writes:
+
+- `~/.hermes/reports/daily-dev-report-YYYYMMDD-HHMMSS.md`
+- `~/.hermes/reports/daily-dev-report-YYYYMMDD-HHMMSS.pdf`
+- `~/.hermes/reports/HUMAN-UNDERSTANDING-CHECKLIST.md`
+- gbrain page `daily-development-teaching-report-YYYY-MM-DD`, when `gbrain` is available.
+- gbrain page `development-human-understanding-checklist`, when `gbrain` is available.
+
+The cron stdout is a compact Telegram-ready summary ending with `MEDIA:<pdf>`.
+Hermes cron delivery strips that tag and sends the PDF as a native attachment.
+
+## Teaching Standard
+
+The report is written for comprehension, not status theater. For every active
+repository it asks the human to understand:
+
+- Problem: what changed and why the prior state was insufficient.
+- Branches: which branches carried the work.
+- Solution: why the resolution fits the codebase.
+- Edge cases: what tests, CI, or proof boundaries should protect the change.
+- Context: what future work this enables or blocks.
+
+The checklist is deliberately persistent. Do not mark an item complete until the
+human can explain it in her own words.
+
+## Manual Verification
+
+```bash
+python -m hermes_cli.daily_dev_report \
+  --owner happybigmtn \
+  --lookback-hours 24 \
+  --out-dir /tmp/hermes-daily-report \
+  --no-gbrain
+```
+
+Open the generated PDF and confirm the Telegram summary includes the PDF path as
+a `MEDIA:` tag.
