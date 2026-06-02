@@ -138,6 +138,7 @@ def test_next_action_supervises_active_worker_before_stale_board_packets(isolate
         title="codex",
     )
     monkeypatch.setattr("hermes_cli.dev_manager_next_action._latest_commit", lambda repo: None)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: [])
     monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
 
     packet = collect_manager_packet(
