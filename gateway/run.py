@@ -7296,6 +7296,11 @@ class GatewayRunner:
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        if not event.get_command() and self._is_mastery_prompt_reply(event):
+            mastery_reply = (event.text or "").strip()
+            if mastery_reply:
+                return await self._record_mastery_answer_text(mastery_reply)
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -7689,6 +7694,12 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
                 return await self._handle_subgoal_command(event)
 
+            # /mastery_answer is control-plane bookkeeping for the daily
+            # teaching loop. It updates the durable checklist and must not
+            # interrupt an active engineering run.
+            if _cmd_def_inner and _cmd_def_inner.name == "mastery-answer":
+                return await self._handle_mastery_answer_command(event)
+
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
             # the tool-progress display mode for the ongoing stream.
@@ -7973,6 +7984,9 @@ class GatewayRunner:
 
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
+
+        if canonical == "mastery-answer":
+            return await self._handle_mastery_answer_command(event)
 
         if canonical == "status":
             return await self._handle_status_command(event)
@@ -10078,6 +10092,54 @@ class GatewayRunner:
             f"Tier: user\n"
             f"Slash commands you can run: {runnable_str}"
         )
+
+
+    @staticmethod
+    def _is_mastery_prompt_reply(event: MessageEvent) -> bool:
+        """Return True when the user replied to the daily mastery prompt."""
+        reply_text = (getattr(event, "reply_to_text", None) or "").lower()
+        if not reply_text:
+            return False
+        return (
+            "daily development mastery check" in reply_text
+            and (
+                "current stage:" in reply_text
+                or "answer the prompt" in reply_text
+                or "current mastery stage" in reply_text
+            )
+        )
+
+
+    async def _record_mastery_answer_text(self, answer: str) -> str:
+        """Record one daily mastery answer without invoking the LLM."""
+        from datetime import timezone as _timezone
+
+        from hermes_cli.daily_dev_report import CHECKLIST_NAME, DEFAULT_REPORT_DIR
+        from hermes_cli.daily_mastery_answer import record_mastery_answer
+        from hermes_cli.daily_mastery_answer import telegram_summary as _mastery_summary
+
+        result = await asyncio.to_thread(
+            record_mastery_answer,
+            checklist_path=DEFAULT_REPORT_DIR / CHECKLIST_NAME,
+            report_dir=DEFAULT_REPORT_DIR,
+            answer=answer,
+            answered_at=datetime.now(_timezone.utc),
+            write_gbrain=True,
+        )
+        return _mastery_summary(result)
+
+
+    async def _handle_mastery_answer_command(self, event: MessageEvent) -> str:
+        """Handle /mastery_answer <answer> from gateway platforms."""
+        answer = event.get_command_args().strip()
+        if not answer or answer in {"help", "--help", "-h"}:
+            return (
+                "Usage: /mastery_answer <answer>\n\n"
+                "Answer the current daily development mastery stage with concrete "
+                "repos, branches, commits, artifacts, tests, or blockers. You can "
+                "also reply directly to the daily mastery prompt message."
+            )
+        return await self._record_mastery_answer_text(answer)
 
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:

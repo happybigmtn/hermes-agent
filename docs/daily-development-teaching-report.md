@@ -83,6 +83,10 @@ When the human answers, pipe that answer into:
 ~/.hermes/scripts/mastery-check-answer.py --answer-file -
 ```
 
+In Telegram, the normal path is simpler: reply directly to the mastery prompt,
+or send `/mastery_answer <answer>`. Hermes routes both forms through the same
+answer recorder without invoking the LLM or interrupting an active agent run.
+
 The answer command writes `daily-mastery-answer-YYYYMMDD-HHMMSS.md`, updates the
 running checklist only when the answer names concrete evidence, syncs the answer
 and checklist to gbrain, and prints a Telegram-ready summary naming the next
@@ -131,6 +135,9 @@ printf '%s\n' "The problem in happybigmtn/hermes-agent was ... commit 95e420dd1 
       --out-dir /tmp/hermes-daily-report \
       --answer-file - \
       --no-gbrain
+
+python -m pytest -q tests/gateway/test_slash_access_dispatch.py \
+  tests/cli/test_daily_mastery_answer.py
 ```
 
 Open the generated PDF and confirm the Telegram summary includes the PDF path as

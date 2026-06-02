@@ -49,6 +49,16 @@ def _make_event(text: str, source: SessionSource) -> MessageEvent:
     return MessageEvent(text=text, source=source, message_id="m1")
 
 
+def _make_reply_event(text: str, source: SessionSource, reply_to_text: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=source,
+        message_id="m1",
+        reply_to_message_id="prompt-1",
+        reply_to_text=reply_to_text,
+    )
+
+
 def _make_runner(*, platform_extra: dict | None = None,
                  platform: Platform = Platform.DISCORD):
     from gateway.run import GatewayRunner
@@ -108,6 +118,40 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     return runner
+
+
+def _stub_mastery_answer(monkeypatch):
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def fake_record_mastery_answer(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            accepted=True,
+            markdown_path="/tmp/daily-mastery-answer.md",
+            checklist_path="/tmp/HUMAN-UNDERSTANDING-CHECKLIST.md",
+            section_title="2026-06-01 20:00 EDT Report",
+            stage="Problem: she can explain what changed.",
+            next_stage="Branches: she can name branches.",
+            reasons=[],
+            evidence_categories=["repo", "commit", "validation"],
+            gbrain_slug="development-mastery-answer-2026-06-01-203000",
+            gbrain_error=None,
+        )
+
+    def fake_summary(result):
+        return f"mastery-summary accepted={result.accepted} stage={result.stage}"
+
+    monkeypatch.setattr(
+        "hermes_cli.daily_mastery_answer.record_mastery_answer",
+        fake_record_mastery_answer,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.daily_mastery_answer.telegram_summary",
+        fake_summary,
+    )
+    return captured
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +262,81 @@ async def test_user_runs_listed_command():
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
     assert "⛔" not in result
     assert "Tier: user" in result
+
+
+@pytest.mark.asyncio
+async def test_mastery_answer_command_records_current_stage(monkeypatch):
+    captured = _stub_mastery_answer(monkeypatch)
+    runner = _make_runner(platform_extra={})
+    answer = (
+        "The problem in happybigmtn/hermes-agent was manual checklist advancement; "
+        "commit bccf4d17d added the answer recorder and pytest passed."
+    )
+
+    result = await runner._handle_message(
+        _make_event(f"/mastery_answer {answer}", _make_source(user_id="999"))
+    )
+
+    assert result == "mastery-summary accepted=True stage=Problem: she can explain what changed."
+    assert captured["answer"] == answer
+    assert captured["write_gbrain"] is True
+
+
+@pytest.mark.asyncio
+async def test_mastery_answer_command_requires_payload():
+    runner = _make_runner(platform_extra={})
+
+    result = await runner._handle_message(
+        _make_event("/mastery_answer", _make_source(user_id="999"))
+    )
+
+    assert "Usage: /mastery_answer <answer>" in result
+    assert "reply directly to the daily mastery prompt" in result
+
+
+@pytest.mark.asyncio
+async def test_mastery_prompt_reply_records_answer_without_slash(monkeypatch):
+    captured = _stub_mastery_answer(monkeypatch)
+    runner = _make_runner(platform_extra={})
+    answer = (
+        "The problem in happybigmtn/hermes-agent was that Telegram replies were "
+        "not routed; branch rk/daily-dev-teaching-report and commit bccf4d17d "
+        "now give a tested artifact."
+    )
+
+    result = await runner._handle_message(
+        _make_reply_event(
+            answer,
+            _make_source(user_id="999", platform=Platform.TELEGRAM),
+            "Daily development mastery check ready.\nCurrent stage: Problem: explain it.",
+        )
+    )
+
+    assert result == "mastery-summary accepted=True stage=Problem: she can explain what changed."
+    assert captured["answer"] == answer
+
+
+@pytest.mark.asyncio
+async def test_mastery_answer_fastpath_does_not_interrupt_running_agent(monkeypatch):
+    captured = _stub_mastery_answer(monkeypatch)
+    runner = _make_runner(platform_extra={})
+    src = _make_source(user_id="999")
+    sk = build_session_key(src)
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+    runner._running_agents_ts[sk] = 0
+
+    result = await runner._handle_message(
+        _make_event(
+            "/mastery_answer happybigmtn/hermes-agent branch rk/daily-dev-teaching-report "
+            "commit bccf4d17d tests passed because manual advancement was the gap",
+            src,
+        )
+    )
+
+    assert result == "mastery-summary accepted=True stage=Problem: she can explain what changed."
+    running_agent.interrupt.assert_not_called()
+    assert "happybigmtn/hermes-agent" in captured["answer"]
 
 
 # ---------------------------------------------------------------------------
