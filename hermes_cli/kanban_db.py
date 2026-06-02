@@ -152,6 +152,17 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 # during the launch window.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
+# Skills that define the expected lane for common kanban worker profiles.
+# These are additive to the universal kanban-worker skill and to any
+# per-task skills. Missing skills are skipped at spawn time so older installs
+# keep working while configured installs get deterministic role behavior.
+DEFAULT_ASSIGNEE_SKILLS: dict[str, tuple[str, ...]] = {
+    "codexworker": ("kanban-codex-lane", "codex"),
+    "designcritic": ("claude-design",),
+    "reviewer": ("github-code-review",),
+    "orchestrator": ("kanban-orchestrator",),
+}
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -6338,6 +6349,38 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _skill_available(hermes_home: Optional[str], skill_name: str) -> bool:
+    """True if ``skill_name`` resolves for the home the worker runs under."""
+    from pathlib import Path as _Path
+
+    name = str(skill_name or "").strip()
+    if not name:
+        return False
+
+    # An unset HERMES_HOME means the worker falls back to the default root
+    # home (``~/.hermes``), which ships the bundled skills.
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+
+    # Check the most common bundled-group layouts first, then fall back to a
+    # bounded recursive search. Skill names are directory names; reject path
+    # separators here so a malformed profile name cannot influence traversal.
+    if "/" in name or "\\" in name:
+        return False
+    for group in ("devops", "autonomous-ai-agents", "github", "creative"):
+        if (skills_root / group / name / "SKILL.md").is_file():
+            return True
+    try:
+        for skill_md in skills_root.rglob(f"{name}/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     """True if the bundled ``kanban-worker`` skill resolves for the home the
     spawned worker will run under.
@@ -6352,25 +6395,28 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
     omitting the flag only drops the supplementary pattern library.
     """
-    from pathlib import Path as _Path
+    return _skill_available(hermes_home, "kanban-worker")
 
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
-    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
-    try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
-    return False
+
+def _assignee_default_skills(profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+    """Return role-lane skills for ``profile_arg`` that resolve locally."""
+    names = DEFAULT_ASSIGNEE_SKILLS.get(str(profile_arg or "").casefold(), ())
+    return [name for name in names if _skill_available(hermes_home, name)]
+
+
+def _extend_skill_args(cmd: list[str], skills: Iterable[str]) -> None:
+    """Append ``--skills`` pairs in order, skipping empties and duplicates."""
+    seen: set[str] = {
+        cmd[i + 1]
+        for i, tok in enumerate(cmd[:-1])
+        if tok == "--skills"
+    }
+    for skill in skills:
+        name = str(skill or "").strip()
+        if not name or name in seen:
+            continue
+        cmd.extend(["--skills", name])
+        seen.add(name)
 
 
 def _worker_terminal_timeout_env(
@@ -6522,7 +6568,8 @@ def _default_spawn(
     # fatal at CLI startup. Omitting it is safe — the lifecycle
     # contract still ships via KANBAN_GUIDANCE.
     if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
+        _extend_skill_args(cmd, ["kanban-worker"])
+    _extend_skill_args(cmd, _assignee_default_skills(profile_arg, env.get("HERMES_HOME")))
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
@@ -6531,9 +6578,7 @@ def _default_spawn(
     # Dedupe against the built-in so we don't double-load kanban-worker
     # if a task author asks for it explicitly.
     if task.skills:
-        for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
+        _extend_skill_args(cmd, task.skills)
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([

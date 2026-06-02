@@ -2758,6 +2758,40 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_default_spawn_loads_assignee_role_skills(kanban_home, monkeypatch):
+    """Known worker profiles should load their lane skills automatically."""
+    available = {"kanban-worker", "kanban-codex-lane", "codex"}
+    monkeypatch.setattr(kb, "_skill_available", lambda _h, name: name in available)
+    captured = {}
+
+    class FakeProc:
+        pid = 777
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="codex lane", assignee="codexworker")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
+    ]
+    assert skill_names[:3] == ["kanban-worker", "kanban-codex-lane", "codex"]
+    assert max(i for i, tok in enumerate(cmd) if tok == "--skills") < cmd.index("chat")
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 
@@ -3068,6 +3102,45 @@ def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monke
     assert len(worker_pairs) == 1, (
         f"kanban-worker appeared {len(worker_pairs)} times in argv: {cmd}"
     )
+
+
+def test_default_spawn_dedupes_role_skills_from_task_skills(kanban_home, monkeypatch):
+    """Task-specific skills should not duplicate the assignee lane skills."""
+    available = {"kanban-worker", "kanban-codex-lane", "codex", "translation"}
+    monkeypatch.setattr(kb, "_skill_available", lambda _h, name: name in available)
+    captured = {}
+
+    class FakeProc:
+        pid = 2
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="dup role",
+            assignee="codexworker",
+            skills=["codex", "translation"],
+        )
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
+    ]
+    assert skill_names.count("codex") == 1, skill_names
+    assert "translation" in skill_names
 
 
 def test_cli_create_skill_flag_repeatable(kanban_home):
