@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import subprocess
 
 from hermes_cli.dev_run_status import WorkerSession
 from hermes_cli.dev_supervision_closeout import (
     CloseoutResult,
+    EvidenceGrade,
     RepoSnapshot,
     SteerHistoryEntry,
     _looks_like_tool_call_blob,
@@ -121,13 +123,93 @@ def test_collect_closeout_writes_report_without_real_tmux_or_gbrain(tmp_path, mo
     assert "Supervise repo ludeme session ludeme-codex" in text
     assert "M README.md" in text
     assert "receipt.md" in text
+    assert "Grade: `weak`" in text
+    assert "pane prose is not proof" in text
     summary = telegram_summary(result)
     assert "Dev supervision closeout ready." in summary
     assert "worker: ludeme-codex:0.0" in summary
+    assert "evidence: weak" in summary
     assert "manager events: 1" in summary
     assert "steer snippets: 1" in summary
     assert "gbrain:" not in summary
+    assert "attention: do not claim worker success from pane prose" in summary
     assert "attention: repo has uncommitted changes" in summary
+
+
+def test_collect_closeout_grades_fresh_machine_receipt_verified(tmp_path, monkeypatch):
+    repo = tmp_path / "ludeme"
+    _init_repo(repo)
+    receipts = repo / "verification-receipts"
+    receipts.mkdir()
+    (receipts / "t_123.json").write_text('{"status": "passed", "tests": ["cargo test"]}\n', encoding="utf-8")
+
+    monkeypatch.setattr("hermes_cli.dev_supervision_closeout.capture_pane", lambda target, lines: [])
+    monkeypatch.setattr("hermes_cli.dev_supervision_closeout.matching_events", lambda **kwargs: [])
+
+    result = collect_closeout(
+        repo=repo,
+        session="ludeme-codex",
+        report_dir=tmp_path / "reports",
+        generated_at=datetime(2026, 6, 2, 3, 30, tzinfo=timezone.utc),
+        write_gbrain=False,
+        workers=[_worker(repo)],
+        include_steer_history=False,
+    )
+
+    assert result.evidence_grade.grade == "verified"
+    text = result.markdown_path.read_text(encoding="utf-8")
+    assert "Grade: `verified`" in text
+    assert "verification-receipts/t_123.json" in text
+    assert "status `passed`" in text
+    assert "evidence: verified" in telegram_summary(result)
+
+
+def test_collect_closeout_marks_machine_receipt_stale_after_new_manager_event(tmp_path, monkeypatch):
+    repo = tmp_path / "ludeme"
+    _init_repo(repo)
+    receipts = repo / "verification-receipts"
+    receipts.mkdir()
+    receipt = receipts / "t_123.json"
+    receipt.write_text('{"status": "passed"}\n', encoding="utf-8")
+    old_ts = datetime(2026, 6, 2, 3, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(receipt, (old_ts, old_ts))
+    event_time = datetime(2026, 6, 2, 3, 30, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("hermes_cli.dev_supervision_closeout.capture_pane", lambda target, lines: [])
+    monkeypatch.setattr(
+        "hermes_cli.dev_supervision_closeout.matching_events",
+        lambda **kwargs: [
+            ManagerEvent(
+                id="evt1",
+                created_at=event_time,
+                event_type="worker-start",
+                repo=str(repo),
+                worker_session="ludeme-codex",
+                intent="Run newer work.",
+                requested_by="hermes",
+                delivery_channel="telegram",
+                resulting_artifacts=[],
+            )
+        ],
+    )
+
+    result = collect_closeout(
+        repo=repo,
+        session="ludeme-codex",
+        report_dir=tmp_path / "reports",
+        generated_at=datetime(2026, 6, 2, 3, 45, tzinfo=timezone.utc),
+        write_gbrain=False,
+        workers=[_worker(repo)],
+        include_steer_history=False,
+    )
+
+    assert result.evidence_grade.grade == "stale"
+    text = result.markdown_path.read_text(encoding="utf-8")
+    assert "none are newer than the latest manager event" in text
+    assert "Freshness threshold: `2026-06-02T03:30:00+00:00`" in text
+    summary = telegram_summary(result)
+    assert "evidence: stale" in summary
+    assert "attention: do not claim worker success from pane prose" in summary
 
 
 def test_render_markdown_handles_missing_worker(tmp_path):
@@ -168,6 +250,11 @@ def test_main_uses_default_steer_db_paths_when_flag_omitted(tmp_path, monkeypatc
                 recent_commits=[],
                 diff_stat="",
                 recent_artifacts=[],
+            ),
+            evidence_grade=EvidenceGrade(
+                grade="weak",
+                reason="no machine-readable receipt found; pane prose is not proof",
+                receipts=[],
             ),
             pane_capture_lines=0,
             manager_events=[],

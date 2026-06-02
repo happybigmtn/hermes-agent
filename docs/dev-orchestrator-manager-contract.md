@@ -113,17 +113,36 @@ A manager action is successful only when it leaves durable evidence:
 
 If an action cannot produce evidence, it is not a useful manager action yet.
 
+## Receipt Grading Rule
+
+Hermes must grade receipts, not reports. A worker saying "done" in a tmux pane,
+markdown closeout, or Telegram message is useful context, but it is not proof.
+
+Before claiming supervised work passed, Hermes must find fresh
+machine-readable evidence tied to the run:
+
+- `.auto/**/receipt.json`
+- `.auto/**/*receipt*.json`
+- `.auto/**/verification*.json`
+- `verification-receipts/*.json`
+
+The evidence grade has operational meaning:
+
+- `verified`: a fresh machine receipt has a recognized passing status.
+- `failed`: a fresh machine receipt has a recognized failing or blocked status.
+- `stale`: receipts exist, but none are newer than the latest manager event.
+- `receipt-backed`: a fresh receipt exists, but it has no recognized status.
+- `weak`: no machine-readable receipt exists.
+
+Only `verified` should be summarized as passed. Anything else is a handoff,
+investigation, or follow-up state.
+
 ## Current Highest-Impact Improvements
 
-1. Make manager ticks live-session aware so active tmux/Codex/autodev workers
-   outrank stale board packets.
-2. Replace human-facing "Command:" summaries with "Hermes next", "Human
-   action", and evidence requirements.
-3. Add an agentic manager tick that can execute safe inspect/closeout/steer
+1. Add an agentic manager tick that can execute safe inspect/closeout/steer
    actions itself, using the deterministic tick as input.
-4. Maintain a campaign registry across gbrain, tmux, Kanban, and `.auto`
+2. Maintain a campaign registry across gbrain, tmux, Kanban, and `.auto`
    artifacts so Hermes can juggle several repos without relying on memory of a
    prior chat.
-5. Turn every failed campaign into one process improvement: a doc, skill,
+3. Turn every failed campaign into one process improvement: a doc, skill,
    autodev check, Hermes manager behavior, or machine setup fix.
-

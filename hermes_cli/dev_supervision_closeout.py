@@ -8,13 +8,14 @@ Markdown closeout and optionally stores it in gbrain.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 try:
     from zoneinfo import ZoneInfo
@@ -40,6 +41,14 @@ from hermes_cli.dev_manager_events import (
 
 DEFAULT_CAPTURE_LINES = 220
 DEFAULT_GBRAIN_PREFIX = "dev-supervision-closeout"
+MACHINE_RECEIPT_PATTERNS = (
+    ".auto/**/receipt.json",
+    ".auto/**/*receipt*.json",
+    ".auto/**/verification*.json",
+    "verification-receipts/*.json",
+)
+PASS_STATUSES = {"ok", "pass", "passed", "success", "succeeded", "verified", "complete", "completed"}
+FAIL_STATUSES = {"fail", "failed", "failure", "error", "errored", "blocked", "cancelled", "canceled", "timeout"}
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,22 @@ class RepoSnapshot:
     @property
     def clean(self) -> bool:
         return not self.status_short
+
+
+@dataclass(frozen=True)
+class MachineReceipt:
+    path: Path
+    modified_at: datetime
+    status: str | None
+    parse_error: str | None = None
+
+
+@dataclass(frozen=True)
+class EvidenceGrade:
+    grade: str
+    reason: str
+    receipts: list[MachineReceipt]
+    freshness_after: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +117,7 @@ class CloseoutResult:
     dashboard_url: str | None
     worker: WorkerSession | None
     repo_snapshot: RepoSnapshot
+    evidence_grade: EvidenceGrade
     pane_capture_lines: int
     manager_events: list[ManagerEvent]
     steer_history: list[SteerHistoryEntry]
@@ -192,6 +218,104 @@ def collect_repo_snapshot(repo: Path, *, artifact_limit: int = 12) -> RepoSnapsh
         recent_commits=recent_commits,
         diff_stat=diff_stat,
         recent_artifacts=artifacts,
+    )
+
+
+def _receipt_status(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("status", "result", "outcome", "conclusion"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    for key in ("receipt", "verification", "summary"):
+        nested = payload.get(key)
+        nested_status = _receipt_status(nested)
+        if nested_status:
+            return nested_status
+    return None
+
+
+def _machine_receipt_paths(repo: Path) -> list[Path]:
+    found: dict[Path, float] = {}
+    for pattern in MACHINE_RECEIPT_PATTERNS:
+        for path in repo.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                found[path] = path.stat().st_mtime
+            except OSError:
+                continue
+    return sorted(found, key=lambda item: found[item], reverse=True)
+
+
+def collect_machine_receipts(repo: Path, *, limit: int = 12) -> list[MachineReceipt]:
+    receipts: list[MachineReceipt] = []
+    for path in _machine_receipt_paths(repo)[:limit]:
+        modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        status = None
+        parse_error = None
+        try:
+            status = _receipt_status(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as exc:
+            parse_error = _one_line(exc, max_chars=120)
+        receipts.append(
+            MachineReceipt(
+                path=path,
+                modified_at=modified_at,
+                status=status,
+                parse_error=parse_error,
+            )
+        )
+    return receipts
+
+
+def grade_machine_evidence(
+    repo: Path,
+    *,
+    manager_events: Sequence[ManagerEvent],
+) -> EvidenceGrade:
+    receipts = collect_machine_receipts(repo)
+    freshness_after = max((event.created_at for event in manager_events), default=None)
+    current_receipts = [
+        receipt
+        for receipt in receipts
+        if freshness_after is None or receipt.modified_at >= freshness_after
+    ]
+    if not receipts:
+        return EvidenceGrade(
+            grade="weak",
+            reason="no machine-readable receipt found; pane prose is not proof",
+            receipts=[],
+            freshness_after=freshness_after,
+        )
+    if not current_receipts:
+        return EvidenceGrade(
+            grade="stale",
+            reason="machine receipts exist, but none are newer than the latest manager event",
+            receipts=receipts,
+            freshness_after=freshness_after,
+        )
+    statuses = {receipt.status for receipt in current_receipts if receipt.status}
+    if statuses & FAIL_STATUSES:
+        return EvidenceGrade(
+            grade="failed",
+            reason="a fresh machine receipt reports a failing or blocked status",
+            receipts=receipts,
+            freshness_after=freshness_after,
+        )
+    if statuses & PASS_STATUSES:
+        return EvidenceGrade(
+            grade="verified",
+            reason="fresh machine receipt reports a passing status",
+            receipts=receipts,
+            freshness_after=freshness_after,
+        )
+    return EvidenceGrade(
+        grade="receipt-backed",
+        reason="fresh machine receipt exists, but it does not expose a recognized pass/fail status",
+        receipts=receipts,
+        freshness_after=freshness_after,
     )
 
 
@@ -323,6 +447,7 @@ def render_markdown(
     generated_at: datetime,
     worker: WorkerSession | None,
     repo_snapshot: RepoSnapshot,
+    evidence_grade: EvidenceGrade,
     manager_events: Sequence[ManagerEvent],
     steer_history: Sequence[SteerHistoryEntry],
     steer_history_error: str | None,
@@ -385,6 +510,27 @@ def render_markdown(
     lines.extend(
         [
             "",
+            "## Evidence Grade",
+            "",
+            f"Grade: `{evidence_grade.grade}`",
+            f"Reason: {evidence_grade.reason}",
+        ]
+    )
+    if evidence_grade.freshness_after:
+        lines.append(f"Freshness threshold: `{evidence_grade.freshness_after.isoformat()}`")
+    lines.extend(["", "### Machine Receipts", ""])
+    if evidence_grade.receipts:
+        for receipt in evidence_grade.receipts:
+            status = receipt.status or "unknown"
+            line = f"- `{receipt.path}` modified `{receipt.modified_at.isoformat()}` status `{status}`"
+            if receipt.parse_error:
+                line += f" parse_error `{receipt.parse_error}`"
+            lines.append(line)
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
             "## Manager Events",
             "",
             "Source: Hermes manager-event JSONL ledger.",
@@ -438,7 +584,8 @@ def render_markdown(
             "",
             "## Manager Assessment",
             "",
-            "- This closeout is deterministic evidence only; it does not claim the worker succeeded.",
+            "- This closeout grades machine receipts, not worker prose.",
+            "- Only `verified` evidence should be treated as proof that supervised work passed.",
             "- Treat dirty repo state, missing tests, or missing commits as follow-up work.",
             "- Use this page as the handoff anchor before sending more broad steer.",
             "",
@@ -482,6 +629,7 @@ def collect_closeout(
         event_logs=manager_event_paths,
         limit=manager_event_limit,
     )
+    evidence_grade = grade_machine_evidence(repo, manager_events=manager_events)
     steer_history: list[SteerHistoryEntry] = []
     steer_history_error = None
     if include_steer_history:
@@ -501,6 +649,7 @@ def collect_closeout(
         generated_at=generated_at,
         worker=worker,
         repo_snapshot=repo_snapshot,
+        evidence_grade=evidence_grade,
         manager_events=manager_events,
         steer_history=steer_history,
         steer_history_error=steer_history_error,
@@ -519,6 +668,7 @@ def collect_closeout(
         dashboard_url=effective_dashboard_url,
         worker=worker,
         repo_snapshot=repo_snapshot,
+        evidence_grade=evidence_grade,
         pane_capture_lines=len(pane_lines),
         manager_events=manager_events,
         steer_history=steer_history,
@@ -536,6 +686,8 @@ def telegram_summary(result: CloseoutResult) -> str:
         f"worker: {result.worker.target() if result.worker else 'not found'}",
         f"branch: {result.repo_snapshot.branch}",
         f"clean: {result.repo_snapshot.clean}",
+        f"evidence: {result.evidence_grade.grade} ({result.evidence_grade.reason})",
+        f"machine receipts: {len(result.evidence_grade.receipts)}",
         f"manager events: {len(result.manager_events)}",
         f"steer snippets: {len(result.steer_history)}",
         f"pane lines: {result.pane_capture_lines}",
@@ -549,6 +701,8 @@ def telegram_summary(result: CloseoutResult) -> str:
         lines.append(f"gbrain: not synced ({result.gbrain_error})")
     if result.steer_history_error:
         lines.append(f"steer history: warning ({result.steer_history_error})")
+    if result.evidence_grade.grade in {"weak", "stale", "failed"}:
+        lines.append("attention: do not claim worker success from pane prose")
     if result.repo_snapshot.status_short:
         lines.append("attention: repo has uncommitted changes")
     return "\n".join(lines)
