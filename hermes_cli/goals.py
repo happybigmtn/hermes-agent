@@ -188,6 +188,10 @@ class GoalState:
     # them into the verdict. Backwards-compatible: defaults to empty so
     # old state_meta rows load unchanged.
     subgoals: List[str] = field(default_factory=list)
+    # Compact dev-manager packet shown to the agent in the most recent
+    # continuation prompt. Used after the turn to verify that any claimed
+    # progress has a fresh machine-checkable receipt.
+    dev_manager_packet: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -211,6 +215,11 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             subgoals=subgoals,
+            dev_manager_packet=(
+                data.get("dev_manager_packet")
+                if isinstance(data.get("dev_manager_packet"), dict)
+                else None
+            ),
         )
 
     # --- subgoals helpers -------------------------------------------------
@@ -349,12 +358,12 @@ def _dev_manager_goal_preflight_enabled() -> bool:
     return bool(profile and profile in enabled_profiles)
 
 
-def _dev_manager_next_action_context() -> Optional[str]:
+def _dev_manager_next_action_packet_data() -> Optional[Dict[str, Any]]:
     """Return a compact manager state packet for orchestrator goal prompts.
 
     This is deliberately fail-open. The goal loop should continue even if
-    Kanban/gbrain/preflight state is temporarily unreadable; in that case the
-    agent gets no prefix rather than a broken continuation.
+    Kanban/gbrain/preflight state is temporarily unreadable; in that case
+    callers get no packet rather than a broken continuation.
     """
     if not _dev_manager_goal_preflight_enabled():
         return None
@@ -373,18 +382,111 @@ def _dev_manager_next_action_context() -> Optional[str]:
             stale_after=timedelta(minutes=DEFAULT_STALE_MINUTES),
             recent_after=now - timedelta(hours=DEFAULT_RECENT_HOURS),
         )
-        rendered = packet_to_json(packet)
-        rendered = _truncate(rendered, _DEV_MANAGER_PACKET_MAX_CHARS)
-        return DEV_MANAGER_GOAL_PREFLIGHT_TEMPLATE.format(packet=rendered)
+        data = json.loads(packet_to_json(packet))
+        return data if isinstance(data, dict) else None
     except Exception as exc:
         logger.debug("dev manager goal preflight unavailable: %s", exc)
         return None
+
+
+def _dev_manager_next_action_context(packet: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    packet = packet if packet is not None else _dev_manager_next_action_packet_data()
+    if not packet:
+        return None
+    rendered = json.dumps(packet, indent=2, sort_keys=True)
+    rendered = _truncate(rendered, _DEV_MANAGER_PACKET_MAX_CHARS)
+    return DEV_MANAGER_GOAL_PREFLIGHT_TEMPLATE.format(packet=rendered)
 
 
 def _dev_manager_receipt_subgoal() -> Optional[str]:
     if not _dev_manager_goal_preflight_enabled():
         return None
     return DEV_MANAGER_RECEIPT_SUBGOAL
+
+
+def _parse_packet_epoch(value: Any) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return int(datetime.fromisoformat(text).timestamp())
+    except Exception:
+        return None
+
+
+def _response_cites_task(response: str, *, board: str, task_id: str) -> bool:
+    text = response or ""
+    return task_id in text and (board in text or f"{board}/{task_id}" in text)
+
+
+def _has_fresh_kanban_receipt(*, board: str, task_id: str, evidence_after_epoch: int) -> bool:
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=board)
+    try:
+        comments = kb.list_comments(conn, task_id)
+        if any(int(comment.created_at) >= evidence_after_epoch for comment in comments):
+            return True
+        events = kb.list_events(conn, task_id)
+        if any(int(event.created_at) >= evidence_after_epoch for event in events):
+            return True
+        runs = kb.list_runs(conn, task_id)
+        for run in runs:
+            timestamps = [run.started_at]
+            if run.ended_at is not None:
+                timestamps.append(run.ended_at)
+            if any(int(ts) >= evidence_after_epoch for ts in timestamps):
+                return True
+    finally:
+        conn.close()
+    return False
+
+
+def _dev_manager_machine_receipt_failure(
+    last_response: str,
+    packet: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Return a failure reason when a manager response lacks fresh Kanban proof.
+
+    This is intentionally narrow: only next actions with a concrete
+    Kanban board/task are machine-verifiable in this first pass. Other
+    evidence types remain governed by the prompt/judge contract until
+    they get their own structured verifier.
+    """
+    if not packet:
+        return None
+    next_action = packet.get("next_action")
+    if not isinstance(next_action, dict):
+        return None
+    board = str(next_action.get("board") or "").strip()
+    task_id = str(next_action.get("task_id") or "").strip()
+    if not board or not task_id:
+        return None
+    evidence_after = _parse_packet_epoch(
+        next_action.get("evidence_after") or packet.get("generated_at")
+    )
+    if evidence_after is None:
+        return None
+    if not _response_cites_task(last_response, board=board, task_id=task_id):
+        return (
+            "dev-manager receipt check failed: response did not cite the "
+            f"current Kanban target `{board}/{task_id}`"
+        )
+    try:
+        if _has_fresh_kanban_receipt(
+            board=board,
+            task_id=task_id,
+            evidence_after_epoch=evidence_after,
+        ):
+            return None
+    except Exception as exc:
+        logger.debug("dev manager receipt verification unavailable: %s", exc)
+        return None
+    return (
+        "dev-manager receipt check failed: no fresh machine-verifiable Kanban "
+        f"comment, event, or run was found for `{board}/{task_id}` at or after "
+        f"`{next_action.get('evidence_after') or packet.get('generated_at')}`"
+    )
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -751,10 +853,18 @@ class GoalManager:
         receipt_subgoal = _dev_manager_receipt_subgoal()
         if receipt_subgoal:
             judge_subgoals.append(receipt_subgoal)
+        receipt_failure = (
+            _dev_manager_machine_receipt_failure(last_response, state.dev_manager_packet)
+            if _dev_manager_goal_preflight_enabled()
+            else None
+        )
 
         verdict, reason, parse_failed = judge_goal(
             state.goal, last_response, subgoals=judge_subgoals or None
         )
+        if receipt_failure:
+            verdict = "continue"
+            reason = receipt_failure
         state.last_verdict = verdict
         state.last_reason = reason
 
@@ -846,7 +956,14 @@ class GoalManager:
             )
         else:
             prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
-        manager_context = _dev_manager_next_action_context()
+        manager_packet = _dev_manager_next_action_packet_data()
+        if manager_packet:
+            self._state.dev_manager_packet = manager_packet
+            save_goal(self.session_id, self._state)
+        elif self._state.dev_manager_packet is not None:
+            self._state.dev_manager_packet = None
+            save_goal(self.session_id, self._state)
+        manager_context = _dev_manager_next_action_context(manager_packet) if manager_packet else None
         if manager_context:
             return manager_context + prompt
         return prompt

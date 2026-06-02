@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -357,10 +358,20 @@ class TestGoalManager:
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
+        packet = {
+            "generated_at": "2026-06-02T02:30:00+00:00",
+            "next_action": {
+                "kind": "repair-blocked-task",
+                "board": "ludeme",
+                "task_id": "t_abc123",
+                "evidence_after": "2026-06-02T02:30:00+00:00",
+                "required_evidence": "fresh Kanban receipt",
+            },
+        }
         monkeypatch.setattr(
             goals,
-            "_dev_manager_next_action_context",
-            lambda: "[Dev manager next-action preflight]\npacket-json\n\n",
+            "_dev_manager_next_action_packet_data",
+            lambda: packet,
         )
         mgr = GoalManager(session_id="manager-cont-sid")
         mgr.set("keep improving the orchestrator")
@@ -369,8 +380,10 @@ class TestGoalManager:
 
         assert prompt is not None
         assert prompt.startswith("[Dev manager next-action preflight]")
-        assert "packet-json" in prompt
+        assert "t_abc123" in prompt
         assert "Goal: keep improving the orchestrator" in prompt
+        assert mgr.state is not None
+        assert mgr.state.dev_manager_packet == packet
 
     def test_manager_goal_judge_requires_receipt_evidence(self, hermes_home, monkeypatch):
         from hermes_cli import goals
@@ -389,6 +402,78 @@ class TestGoalManager:
         assert any("Kanban comment/status/run summary" in item for item in passed_subgoals)
         assert any("next_action.evidence_after" in item for item in passed_subgoals)
         assert any("Older evidence from previous turns" in item for item in passed_subgoals)
+
+    def test_manager_goal_forces_continue_without_fresh_kanban_receipt(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.goals import GoalManager
+
+        kb.init_db()
+        kb.create_board("ludeme")
+        conn = kb.connect(board="ludeme")
+        try:
+            task_id = kb.create_task(conn, title="needs fresh proof", assignee="codexworker")
+        finally:
+            conn.close()
+
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        packet = {
+            "generated_at": future.isoformat(),
+            "next_action": {
+                "kind": "repair-blocked-task",
+                "board": "ludeme",
+                "task_id": task_id,
+                "evidence_after": future.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-missing-machine-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "looks done", False)):
+            decision = mgr.evaluate_after_turn(f"Updated ludeme/{task_id} with a Kanban receipt.")
+
+        assert decision["should_continue"] is True
+        assert decision["verdict"] == "continue"
+        assert "no fresh machine-verifiable Kanban" in decision["reason"]
+
+    def test_manager_goal_allows_done_with_fresh_kanban_comment_receipt(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.goals import GoalManager
+
+        kb.init_db()
+        kb.create_board("ludeme")
+        conn = kb.connect(board="ludeme")
+        try:
+            task_id = kb.create_task(conn, title="has fresh proof", assignee="codexworker")
+            evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+            kb.add_comment(conn, task_id, "orchestrator", "fresh receipt: focused tests passed")
+        finally:
+            conn.close()
+
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "repair-blocked-task",
+                "board": "ludeme",
+                "task_id": task_id,
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-fresh-machine-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh receipt cited", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Progress is backed by a fresh Kanban comment on ludeme/{task_id}."
+            )
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "done"
 
 
 # ──────────────────────────────────────────────────────────────────────
