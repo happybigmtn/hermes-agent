@@ -8,6 +8,7 @@ stale, or ready for intervention before commits exist.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import shutil
@@ -27,6 +28,8 @@ DEFAULT_REPO_ROOTS = [Path("/srv/dev/repos"), Path.home() / "coding", Path.home(
 DEFAULT_REPORT_DIR = Path.home() / ".hermes" / "reports"
 DEFAULT_STALE_MINUTES = 30
 DEFAULT_RECENT_HOURS = 2
+DEFAULT_DASHBOARD_PORT = 8765
+DEFAULT_DASHBOARD_FILENAME = "dev-run-status-latest.html"
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_GBRAIN_SLUG = "dev-orchestrator-active-run-status"
 
@@ -83,6 +86,55 @@ class ArtifactRecord:
     mtime: datetime
     size: int
     kind: str
+
+
+@dataclass(frozen=True)
+class WorkerSession:
+    session_name: str
+    window_index: str
+    pane_index: str
+    pane_pid: int | None
+    current_command: str
+    current_path: Path | None
+    active: bool
+    dead: bool
+    title: str
+
+    def target(self) -> str:
+        return f"{self.session_name}:{self.window_index}.{self.pane_index}"
+
+    def kind(self) -> str:
+        haystack = " ".join(
+            part.lower()
+            for part in (
+                self.session_name,
+                self.title,
+                self.current_command,
+                str(self.current_path or ""),
+            )
+        )
+        if "codex" in haystack:
+            return "codex"
+        if "claude" in haystack:
+            return "claude"
+        if "auto" in haystack:
+            return "autodev"
+        return "shell"
+
+    def repo_slug(self, repo_roots: Sequence[Path]) -> str | None:
+        if self.current_path is None:
+            return None
+        try:
+            resolved = self.current_path.resolve()
+        except OSError:
+            resolved = self.current_path
+        for root in repo_roots:
+            try:
+                relative = resolved.relative_to(root)
+            except ValueError:
+                continue
+            return relative.parts[0] if relative.parts else None
+        return None
 
 
 @dataclass
@@ -150,10 +202,17 @@ class StatusResult:
     runs: list[RunSummary]
     generated_at: datetime
     stale_after: timedelta
+    worker_sessions: list[WorkerSession] = field(default_factory=list)
+    dashboard_path: Path | None = None
+    dashboard_url: str | None = None
 
     @property
     def active_count(self) -> int:
         return sum(1 for run in self.runs if run.active)
+
+    @property
+    def worker_count(self) -> int:
+        return sum(1 for session in self.worker_sessions if not session.dead)
 
     @property
     def attention_count(self) -> int:
@@ -241,6 +300,61 @@ def list_orchestrator_processes() -> list[ProcessRecord]:
         if any(marker in command for marker in PROCESS_MARKERS) and "dev_run_status" not in command:
             filtered.append(record)
     return filtered
+
+
+def parse_tmux_panes(output: str) -> list[WorkerSession]:
+    sessions: list[WorkerSession] = []
+    for raw in output.splitlines():
+        parts = raw.rstrip("\n").split("\t")
+        if len(parts) < 9:
+            continue
+        session_name, window_index, pane_index, pane_pid_s, command, path_s, active_s, dead_s, title = parts[:9]
+        try:
+            pane_pid = int(pane_pid_s)
+        except ValueError:
+            pane_pid = None
+        sessions.append(
+            WorkerSession(
+                session_name=session_name,
+                window_index=window_index,
+                pane_index=pane_index,
+                pane_pid=pane_pid,
+                current_command=command,
+                current_path=Path(path_s) if path_s else None,
+                active=active_s == "1",
+                dead=dead_s == "1",
+                title=title,
+            )
+        )
+    return sessions
+
+
+def list_tmux_worker_sessions() -> list[WorkerSession]:
+    if not shutil.which("tmux"):
+        return []
+    fmt = "\t".join(
+        (
+            "#{session_name}",
+            "#{window_index}",
+            "#{pane_index}",
+            "#{pane_pid}",
+            "#{pane_current_command}",
+            "#{pane_current_path}",
+            "#{pane_active}",
+            "#{pane_dead}",
+            "#{pane_title}",
+        )
+    )
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", fmt],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return parse_tmux_panes(result.stdout)
 
 
 def read_run_env(path: Path) -> dict[str, str]:
@@ -521,19 +635,159 @@ def collect_status(
     return runs
 
 
-def render_markdown(runs: Sequence[RunSummary], *, generated_at: datetime, stale_after: timedelta) -> str:
+def _tailscale_ip() -> str | None:
+    if not shutil.which("tailscale"):
+        return None
+    try:
+        result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if value:
+            return value
+    return None
+
+
+def default_dashboard_url() -> str | None:
+    configured = os.getenv("HERMES_DEV_RUN_STATUS_DASHBOARD_URL")
+    if configured:
+        return configured
+    ip = _tailscale_ip()
+    if not ip:
+        return None
+    return f"http://{ip}:{DEFAULT_DASHBOARD_PORT}/{DEFAULT_DASHBOARD_FILENAME}"
+
+
+def render_dashboard_html(
+    runs: Sequence[RunSummary],
+    worker_sessions: Sequence[WorkerSession],
+    *,
+    generated_at: datetime,
+    stale_after: timedelta,
+    markdown: str,
+) -> str:
+    active_runs = sum(1 for run in runs if run.active)
+    attention = sum(1 for run in runs if run.attention)
+    live_workers = sum(1 for session in worker_sessions if not session.dead)
+    worker_rows: list[str] = []
+    for session in worker_sessions:
+        state = "dead" if session.dead else "active" if session.active else "idle"
+        steer = f"tmux send-keys -t {session.target()} '<message>' C-m"
+        worker_rows.append(
+            "<tr>"
+            f"<td>{html.escape(session.target())}</td>"
+            f"<td>{html.escape(session.kind())}</td>"
+            f"<td>{html.escape(state)}</td>"
+            f"<td>{html.escape(session.current_command or 'unknown')}</td>"
+            f"<td>{html.escape(str(session.current_path or 'unknown'))}</td>"
+            f"<td><code>{html.escape(steer)}</code></td>"
+            "</tr>"
+        )
+    if not worker_rows:
+        worker_rows.append('<tr><td colspan="6">No supervised tmux worker panes found.</td></tr>')
+
+    run_rows: list[str] = []
+    for run in runs[:12]:
+        latest = run.latest_artifact()
+        state = "attention" if run.attention else "active" if run.active else "recent"
+        run_rows.append(
+            "<tr>"
+            f"<td>{html.escape(run.repo_slug)}</td>"
+            f"<td>{html.escape(run.run_id)}</td>"
+            f"<td>{html.escape(state)}</td>"
+            f"<td>{html.escape(run.phase())}</td>"
+            f"<td>{html.escape(str(latest.path if latest else 'none'))}</td>"
+            f"<td>{html.escape(run.next_action)}</td>"
+            "</tr>"
+        )
+    if not run_rows:
+        run_rows.append('<tr><td colspan="6">No active or recent autodev run roots found.</td></tr>')
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
+  <title>Dev Orchestrator Status</title>
+  <style>
+    :root {{ color-scheme: dark; --bg: #090d10; --panel: #10161c; --line: #25313b; --text: #e6edf3; --muted: #8b9bab; --gold: #d6aa3f; --cyan: #48d7c8; }}
+    body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    main {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
+    h1 {{ margin: 0 0 4px; font-size: 22px; letter-spacing: 0; }}
+    h2 {{ margin: 28px 0 10px; color: var(--gold); font-size: 15px; }}
+    .muted {{ color: var(--muted); }}
+    .grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }}
+    .metric {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; }}
+    .metric strong {{ display: block; font-size: 28px; color: var(--cyan); }}
+    table {{ width: 100%; border-collapse: collapse; border: 1px solid var(--line); background: var(--panel); }}
+    th, td {{ padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
+    th {{ color: var(--gold); font-weight: 700; }}
+    code {{ color: var(--cyan); }}
+    pre {{ white-space: pre-wrap; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 14px; overflow: auto; }}
+    @media (max-width: 760px) {{ main {{ padding: 16px; }} .grid {{ grid-template-columns: 1fr; }} table {{ font-size: 12px; }} }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Dev Orchestrator Status</h1>
+  <div class="muted">Generated {html.escape(generated_at.isoformat())}; stale threshold {int(stale_after.total_seconds() // 60)} minutes.</div>
+  <section class="grid">
+    <div class="metric"><span>active runs</span><strong>{active_runs}</strong></div>
+    <div class="metric"><span>attention</span><strong>{attention}</strong></div>
+    <div class="metric"><span>tmux workers</span><strong>{live_workers}</strong></div>
+  </section>
+  <h2>Interactive Workers</h2>
+  <table><thead><tr><th>target</th><th>kind</th><th>state</th><th>command</th><th>path</th><th>steer</th></tr></thead><tbody>{''.join(worker_rows)}</tbody></table>
+  <h2>Autodev Runs</h2>
+  <table><thead><tr><th>repo</th><th>run</th><th>state</th><th>phase</th><th>latest artifact</th><th>next action</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table>
+  <h2>Markdown Report</h2>
+  <pre>{html.escape(markdown)}</pre>
+</main>
+</body>
+</html>
+"""
+
+
+def render_markdown(
+    runs: Sequence[RunSummary],
+    *,
+    generated_at: datetime,
+    stale_after: timedelta,
+    worker_sessions: Sequence[WorkerSession] = (),
+    repo_roots: Sequence[Path] = (),
+    dashboard_url: str | None = None,
+) -> str:
     lines = [
         "# Dev Orchestrator Active Run Status",
         "",
         f"Generated: {generated_at.isoformat()}",
         f"Active runs: {sum(1 for run in runs if run.active)}",
         f"Attention needed: {sum(1 for run in runs if run.attention)}",
+        f"Interactive tmux workers: {sum(1 for session in worker_sessions if not session.dead)}",
         f"Stale threshold: {int(stale_after.total_seconds() // 60)} minutes",
         "",
     ]
+    if dashboard_url:
+        lines.extend([f"Dashboard: {dashboard_url}", ""])
+    lines.extend(["## Interactive Workers", ""])
+    if worker_sessions:
+        for session in worker_sessions:
+            state = "dead" if session.dead else "active" if session.active else "idle"
+            repo = session.repo_slug(repo_roots) or "unknown"
+            lines.append(
+                f"- `{session.target()}` {session.kind()} {state}; repo={repo}; command=`{session.current_command or 'unknown'}`; path=`{session.current_path or 'unknown'}`"
+            )
+            lines.append(f"  Steer: `tmux send-keys -t {session.target()} '<message>' C-m`")
+    else:
+        lines.append("No supervised tmux worker panes found.")
+    lines.append("")
     if not runs:
         lines.extend([
-            "## Summary",
+            "## Autodev Runs",
             "",
             "No active or recent orchestrator runs were found.",
             "",
@@ -612,7 +866,11 @@ def generate_status_report(
     write_gbrain: bool = True,
     gbrain_slug: str = DEFAULT_GBRAIN_SLUG,
     processes: Sequence[ProcessRecord] | None = None,
+    worker_sessions: Sequence[WorkerSession] | None = None,
+    dashboard_url: str | None = None,
 ) -> StatusResult:
+    session_records = list(worker_sessions) if worker_sessions is not None else list_tmux_worker_sessions() if processes is None else []
+    effective_dashboard_url = dashboard_url if dashboard_url is not None else default_dashboard_url()
     runs = collect_status(
         repo_roots=repo_roots,
         now=now,
@@ -622,8 +880,21 @@ def generate_status_report(
     )
     report_dir.mkdir(parents=True, exist_ok=True)
     path = report_dir / f"dev-run-status-{now.strftime('%Y%m%d-%H%M%S')}.md"
-    markdown = render_markdown(runs, generated_at=now, stale_after=stale_after)
+    markdown = render_markdown(
+        runs,
+        generated_at=now,
+        stale_after=stale_after,
+        worker_sessions=session_records,
+        repo_roots=repo_roots,
+        dashboard_url=effective_dashboard_url,
+    )
     path.write_text(markdown, encoding="utf-8")
+    (report_dir / "dev-run-status-latest.md").write_text(markdown, encoding="utf-8")
+    dashboard_path = report_dir / DEFAULT_DASHBOARD_FILENAME
+    dashboard_path.write_text(
+        render_dashboard_html(runs, session_records, generated_at=now, stale_after=stale_after, markdown=markdown),
+        encoding="utf-8",
+    )
     gbrain_error = write_gbrain_page(gbrain_slug, markdown) if write_gbrain else None
     return StatusResult(
         markdown_path=path,
@@ -632,6 +903,9 @@ def generate_status_report(
         runs=runs,
         generated_at=now,
         stale_after=stale_after,
+        worker_sessions=session_records,
+        dashboard_path=dashboard_path,
+        dashboard_url=effective_dashboard_url,
     )
 
 
@@ -640,8 +914,13 @@ def telegram_summary(result: StatusResult) -> str:
         "Dev orchestrator active-run status ready.",
         f"Active runs: {result.active_count}",
         f"Attention needed: {result.attention_count}",
+        f"Interactive workers: {result.worker_count}",
         f"Report: {result.markdown_path}",
     ]
+    if result.dashboard_url:
+        lines.append(f"Dashboard: {result.dashboard_url}")
+    elif result.dashboard_path:
+        lines.append(f"Dashboard file: {result.dashboard_path}")
     if result.gbrain_slug:
         lines.append(f"gbrain: {result.gbrain_slug}")
     elif result.gbrain_error:
@@ -680,6 +959,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=float(os.getenv("HERMES_DEV_RUN_STATUS_RECENT_HOURS", DEFAULT_RECENT_HOURS)),
     )
     parser.add_argument("--gbrain-slug", default=os.getenv("HERMES_DEV_RUN_STATUS_GBRAIN_SLUG", DEFAULT_GBRAIN_SLUG))
+    parser.add_argument(
+        "--dashboard-url",
+        default=os.getenv("HERMES_DEV_RUN_STATUS_DASHBOARD_URL"),
+        help="Public or tailnet URL for the generated status dashboard",
+    )
     parser.add_argument("--no-gbrain", action="store_true")
     return parser
 
@@ -702,6 +986,7 @@ def main(argv: list[str] | None = None) -> int:
         recent_after=recent_after,
         write_gbrain=not args.no_gbrain,
         gbrain_slug=args.gbrain_slug,
+        dashboard_url=args.dashboard_url,
     )
     print(telegram_summary(result))
     return 0

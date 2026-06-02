@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import os
 import subprocess
 
 from hermes_cli.dev_run_status import (
     ProcessRecord,
+    WorkerSession,
     collect_status,
     generate_status_report,
     parse_process_table,
+    parse_tmux_panes,
     render_markdown,
     telegram_summary,
     write_gbrain_page,
@@ -36,6 +39,20 @@ def test_parse_process_table_reads_ps_rows():
     assert [record.pid for record in records] == [101, 102]
     assert records[0].label() == "auto gen"
     assert records[1].label() == "codex exec"
+
+
+def test_parse_tmux_panes_reads_interactive_worker_rows():
+    rows = "ludeme-codex\t0\t1\t1234\tcodex\t/srv/dev/repos/ludeme\t1\t0\tworker\n"
+
+    sessions = parse_tmux_panes(rows)
+
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session.target() == "ludeme-codex:0.1"
+    assert session.kind() == "codex"
+    assert session.repo_slug([Path("/srv/dev/repos")]) == "ludeme"
+    assert session.active is True
+    assert session.dead is False
 
 
 def test_collect_status_uses_repo_level_gen_artifacts(tmp_path):
@@ -226,13 +243,33 @@ def test_generate_status_report_writes_markdown_and_summary(tmp_path):
         recent_after=now - timedelta(hours=12),
         write_gbrain=False,
         processes=[],
+        worker_sessions=[
+            WorkerSession(
+                "demo-codex",
+                "0",
+                "0",
+                123,
+                "codex",
+                repo,
+                True,
+                False,
+                "worker",
+            )
+        ],
+        dashboard_url="http://100.64.0.1:8765/dev-run-status-latest.html",
     )
 
     assert result.markdown_path.exists()
     text = result.markdown_path.read_text(encoding="utf-8")
     assert "Dev Orchestrator Active Run Status" in text
+    assert "Interactive tmux workers: 1" in text
+    assert "demo-codex:0.0" in text
+    assert result.dashboard_path is not None
+    assert result.dashboard_path.exists()
     summary = telegram_summary(result)
     assert "Active runs: 0" in summary
+    assert "Interactive workers: 1" in summary
+    assert "Dashboard: http://100.64.0.1:8765/dev-run-status-latest.html" in summary
     assert str(result.markdown_path) in summary
 
 
