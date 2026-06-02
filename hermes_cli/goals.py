@@ -33,9 +33,11 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -442,16 +444,96 @@ def _has_fresh_kanban_receipt(*, board: str, task_id: str, evidence_after_epoch:
     return False
 
 
+_GIT_COMMIT_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+
+def _response_cites_repo(response: str, repo_path: Path) -> bool:
+    text = response or ""
+    candidates = {str(repo_path), repo_path.name}
+    try:
+        candidates.add(str(repo_path.resolve()))
+    except OSError:
+        pass
+    return any(candidate and candidate in text for candidate in candidates)
+
+
+def _response_cites_repo_receipt(response: str) -> bool:
+    text = response or ""
+    return ".auto" in text or bool(_GIT_COMMIT_RE.search(text))
+
+
+def _fresh_auto_artifact_exists(repo_path: Path, evidence_after_epoch: int) -> bool:
+    auto_root = repo_path / ".auto"
+    if not auto_root.exists():
+        return False
+    checked = 0
+    for root, dirs, files in os.walk(auto_root):
+        for name in [*dirs, *files]:
+            path = Path(root) / name
+            try:
+                if int(path.stat().st_mtime) >= evidence_after_epoch:
+                    return True
+            except OSError:
+                continue
+            checked += 1
+            if checked >= 20000:
+                return False
+    return False
+
+
+def _fresh_cited_git_commit_exists(
+    repo_path: Path,
+    response: str,
+    evidence_after_epoch: int,
+) -> bool:
+    candidates = sorted(set(_GIT_COMMIT_RE.findall(response or "")), key=len, reverse=True)
+    for commit in candidates[:20]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), "show", "-s", "--format=%ct", commit],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        raw = (result.stdout or "").strip().splitlines()
+        if not raw:
+            continue
+        try:
+            if int(raw[0]) >= evidence_after_epoch:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _has_fresh_repo_receipt(
+    *,
+    repo_path: Path,
+    response: str,
+    evidence_after_epoch: int,
+) -> bool:
+    if ".auto" in (response or "") and _fresh_auto_artifact_exists(
+        repo_path,
+        evidence_after_epoch,
+    ):
+        return True
+    return _fresh_cited_git_commit_exists(repo_path, response, evidence_after_epoch)
+
+
 def _dev_manager_machine_receipt_failure(
     last_response: str,
     packet: Optional[Dict[str, Any]],
 ) -> Optional[str]:
-    """Return a failure reason when a manager response lacks fresh Kanban proof.
+    """Return a failure reason when a manager response lacks fresh proof.
 
-    This is intentionally narrow: only next actions with a concrete
-    Kanban board/task are machine-verifiable in this first pass. Other
-    evidence types remain governed by the prompt/judge contract until
-    they get their own structured verifier.
+    Kanban board/task receipts and repo-backed `.auto`/git receipts are
+    machine-verifiable here. Other evidence types remain governed by the
+    prompt/judge contract until they get their own structured verifier.
     """
     if not packet:
         return None
@@ -460,31 +542,60 @@ def _dev_manager_machine_receipt_failure(
         return None
     board = str(next_action.get("board") or "").strip()
     task_id = str(next_action.get("task_id") or "").strip()
-    if not board or not task_id:
-        return None
+    repo = str(next_action.get("repo") or "").strip()
     evidence_after = _parse_packet_epoch(
         next_action.get("evidence_after") or packet.get("generated_at")
     )
     if evidence_after is None:
         return None
-    if not _response_cites_task(last_response, board=board, task_id=task_id):
+    if board and task_id:
+        if not _response_cites_task(last_response, board=board, task_id=task_id):
+            return (
+                "dev-manager receipt check failed: response did not cite the "
+                f"current Kanban target `{board}/{task_id}`"
+            )
+        try:
+            if _has_fresh_kanban_receipt(
+                board=board,
+                task_id=task_id,
+                evidence_after_epoch=evidence_after,
+            ):
+                return None
+        except Exception as exc:
+            logger.debug("dev manager receipt verification unavailable: %s", exc)
+            return None
+        return (
+            "dev-manager receipt check failed: no fresh machine-verifiable Kanban "
+            f"comment, event, or run was found for `{board}/{task_id}` at or after "
+            f"`{next_action.get('evidence_after') or packet.get('generated_at')}`"
+        )
+    if not repo:
+        return None
+    repo_path = Path(repo).expanduser()
+    if not _response_cites_repo(last_response, repo_path):
         return (
             "dev-manager receipt check failed: response did not cite the "
-            f"current Kanban target `{board}/{task_id}`"
+            f"current repo target `{repo}`"
+        )
+    if not _response_cites_repo_receipt(last_response):
+        return (
+            "dev-manager receipt check failed: response did not cite a "
+            f"machine-verifiable repo receipt for `{repo}`; cite a fresh `.auto` "
+            "artifact path or git commit hash"
         )
     try:
-        if _has_fresh_kanban_receipt(
-            board=board,
-            task_id=task_id,
+        if _has_fresh_repo_receipt(
+            repo_path=repo_path,
+            response=last_response,
             evidence_after_epoch=evidence_after,
         ):
             return None
     except Exception as exc:
-        logger.debug("dev manager receipt verification unavailable: %s", exc)
+        logger.debug("dev manager repo receipt verification unavailable: %s", exc)
         return None
     return (
-        "dev-manager receipt check failed: no fresh machine-verifiable Kanban "
-        f"comment, event, or run was found for `{board}/{task_id}` at or after "
+        "dev-manager receipt check failed: no fresh machine-verifiable repo "
+        f"artifact or cited git commit was found for `{repo}` at or after "
         f"`{next_action.get('evidence_after') or packet.get('generated_at')}`"
     )
 

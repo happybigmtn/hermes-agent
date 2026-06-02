@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
@@ -470,6 +472,135 @@ class TestGoalManager:
         with patch.object(goals, "judge_goal", return_value=("done", "fresh receipt cited", False)):
             decision = mgr.evaluate_after_turn(
                 f"Progress is backed by a fresh Kanban comment on ludeme/{task_id}."
+            )
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "done"
+
+    def test_manager_goal_forces_continue_without_fresh_repo_auto_artifact(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        repo = tmp_path / "repo"
+        artifact = repo / ".auto" / "logs" / "proof.md"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("old proof", encoding="utf-8")
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        packet = {
+            "generated_at": future.isoformat(),
+            "next_action": {
+                "kind": "inspect-run-attention",
+                "repo": str(repo),
+                "evidence_after": future.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-missing-repo-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "looks done", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Updated {repo}; receipt at {artifact}."
+            )
+
+        assert decision["should_continue"] is True
+        assert decision["verdict"] == "continue"
+        assert "no fresh machine-verifiable repo" in decision["reason"]
+
+    def test_manager_goal_allows_done_with_fresh_repo_auto_artifact(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        repo = tmp_path / "repo"
+        artifact = repo / ".auto" / "logs" / "proof.md"
+        artifact.parent.mkdir(parents=True)
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        artifact.write_text("fresh proof", encoding="utf-8")
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "inspect-run-attention",
+                "repo": str(repo),
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-fresh-repo-auto-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh .auto", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Fresh repo receipt for {repo}: {artifact}"
+            )
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "done"
+
+    def test_manager_goal_allows_done_with_fresh_git_commit_receipt(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        (repo / "proof.txt").write_text("fresh commit proof", encoding="utf-8")
+        subprocess.run(["git", "add", "proof.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "test proof"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "inspect-run-attention",
+                "repo": str(repo),
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-fresh-git-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh commit", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Fresh repo receipt for {repo}: commit {commit}"
             )
 
         assert decision["should_continue"] is False
