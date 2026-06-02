@@ -99,7 +99,10 @@ def test_next_action_flags_blocked_codexworker_for_repair(isolated_kanban_home):
     assert "Dev Orchestrator Manager Next Action" in markdown
     assert tid in markdown
     assert "review-required" in markdown
+    assert "Evidence after:" in markdown
+    assert now.isoformat() in markdown
     assert "Required evidence:" in markdown
+    assert "Evidence must be fresh" in markdown
 
 
 def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home):
@@ -127,7 +130,9 @@ def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home
     summary = telegram_summary(packet)
     assert "Next: dispatch-task" in summary
     assert "Command:" in summary
+    assert f"Evidence after: {now.isoformat()}" in summary
     assert "Evidence:" in summary
+    assert "not copied from prior runs" in summary
 
 
 def test_packet_json_includes_required_evidence(isolated_kanban_home):
@@ -152,8 +157,10 @@ def test_packet_json_includes_required_evidence(isolated_kanban_home):
     data = packet_to_json(packet)
 
     assert tid in data
+    assert '"evidence_after": "2026-06-02T01:45:00+00:00"' in data
     assert "required_evidence" in data
     assert "durable evidence" in data
+    assert "Evidence must be fresh" in data
 
 
 def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):

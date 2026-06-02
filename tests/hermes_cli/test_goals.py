@@ -387,6 +387,8 @@ class TestGoalManager:
         passed_subgoals = judge.call_args.kwargs["subgoals"]
         assert any("durable evidence" in item for item in passed_subgoals)
         assert any("Kanban comment/status/run summary" in item for item in passed_subgoals)
+        assert any("next_action.evidence_after" in item for item in passed_subgoals)
+        assert any("Older evidence from previous turns" in item for item in passed_subgoals)
 
 
 # ──────────────────────────────────────────────────────────────────────

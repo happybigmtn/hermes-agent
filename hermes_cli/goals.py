@@ -112,6 +112,10 @@ DEV_MANAGER_RECEIPT_SUBGOAL = (
     "Dev-manager progress requires durable evidence for the current "
     "`next_action`: a Kanban comment/status/run summary, .auto receipt or "
     "artifact path, gbrain page, git commit/PR, or focused test/check output. "
+    "The evidence must be fresh for the current next-action packet: created "
+    "or updated after `next_action.evidence_after` / the packet `generated_at` "
+    "timestamp. Older evidence from previous turns does not satisfy this "
+    "criterion. "
     "If the response only says work was attempted, planned, or inspected "
     "without citing durable evidence, this criterion is NOT satisfied."
 )
