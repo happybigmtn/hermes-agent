@@ -446,6 +446,11 @@ def _has_fresh_kanban_receipt(*, board: str, task_id: str, evidence_after_epoch:
 
 _GIT_COMMIT_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
 _AUTO_PATH_RE = re.compile(r"(?P<path>(?:~|/|\.{1,2}/)?[^\s`'\"<>]*\.auto/[^\s`'\"<>]+)")
+_GBRAIN_GET_RE = re.compile(r"\bgbrain\s+get\s+[`'\"]?(?P<slug>[a-zA-Z0-9][a-zA-Z0-9_./-]{1,200})")
+_GBRAIN_LABEL_RE = re.compile(
+    r"\bgbrain(?:\s+(?:page|slug|closeout|receipt))?\s*[:=]\s*[`'\"]?"
+    r"(?P<slug>[a-zA-Z0-9][a-zA-Z0-9_./-]{1,200})"
+)
 _PATH_TRAILING_PUNCT = ".,;:)]}"
 
 
@@ -485,6 +490,49 @@ def _response_cites_repo_receipt(response: str, repo_path: Path) -> bool:
     return bool(_cited_auto_artifact_paths(repo_path, response)) or bool(
         _GIT_COMMIT_RE.search(response or "")
     )
+
+
+def _cited_gbrain_slugs(response: str) -> list[str]:
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for regex in (_GBRAIN_GET_RE, _GBRAIN_LABEL_RE):
+        for match in regex.finditer(response or ""):
+            slug = match.group("slug").rstrip(_PATH_TRAILING_PUNCT)
+            if slug and slug not in seen:
+                seen.add(slug)
+                slugs.append(slug)
+    return slugs
+
+
+def _fresh_cited_gbrain_page_exists(response: str, evidence_after: str) -> bool:
+    slugs = _cited_gbrain_slugs(response)
+    if not slugs:
+        return False
+    for slug in slugs[:20]:
+        get_result = subprocess.run(
+            ["gbrain", "get", slug],
+            cwd="/tmp",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if get_result.returncode != 0:
+            continue
+        list_result = subprocess.run(
+            ["gbrain", "list", "--updated-after", evidence_after, "--limit", "200"],
+            cwd="/tmp",
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if list_result.returncode != 0:
+            continue
+        for line in (list_result.stdout or "").splitlines():
+            if line.split("\t", 1)[0].strip() == slug:
+                return True
+    return False
 
 
 def _fresh_cited_auto_artifact_exists(
@@ -567,6 +615,9 @@ def _dev_manager_machine_receipt_failure(
     evidence_after = _parse_packet_epoch(
         next_action.get("evidence_after") or packet.get("generated_at")
     )
+    evidence_after_text = str(
+        next_action.get("evidence_after") or packet.get("generated_at") or ""
+    )
     if evidence_after is None:
         return None
     if board and task_id:
@@ -580,6 +631,9 @@ def _dev_manager_machine_receipt_failure(
                 board=board,
                 task_id=task_id,
                 evidence_after_epoch=evidence_after,
+            ) or _fresh_cited_gbrain_page_exists(
+                last_response,
+                evidence_after_text,
             ):
                 return None
         except Exception as exc:
@@ -587,7 +641,8 @@ def _dev_manager_machine_receipt_failure(
             return None
         return (
             "dev-manager receipt check failed: no fresh machine-verifiable Kanban "
-            f"comment, event, or run was found for `{board}/{task_id}` at or after "
+            "comment, event, run, or gbrain page was found for "
+            f"`{board}/{task_id}` at or after "
             f"`{next_action.get('evidence_after') or packet.get('generated_at')}`"
         )
     if not repo:
@@ -598,17 +653,21 @@ def _dev_manager_machine_receipt_failure(
             "dev-manager receipt check failed: response did not cite the "
             f"current repo target `{repo}`"
         )
-    if not _response_cites_repo_receipt(last_response, repo_path):
+    cites_gbrain = bool(_cited_gbrain_slugs(last_response))
+    if not _response_cites_repo_receipt(last_response, repo_path) and not cites_gbrain:
         return (
             "dev-manager receipt check failed: response did not cite a "
             f"machine-verifiable repo receipt for `{repo}`; cite a fresh `.auto` "
-            "artifact path or git commit hash"
+            "artifact path, git commit hash, or gbrain page slug"
         )
     try:
         if _has_fresh_repo_receipt(
             repo_path=repo_path,
             response=last_response,
             evidence_after_epoch=evidence_after,
+        ) or _fresh_cited_gbrain_page_exists(
+            last_response,
+            evidence_after_text,
         ):
             return None
     except Exception as exc:
@@ -616,7 +675,7 @@ def _dev_manager_machine_receipt_failure(
         return None
     return (
         "dev-manager receipt check failed: no fresh machine-verifiable repo "
-        f"artifact or cited git commit was found for `{repo}` at or after "
+        f"artifact, cited git commit, or gbrain page was found for `{repo}` at or after "
         f"`{next_action.get('evidence_after') or packet.get('generated_at')}`"
     )
 

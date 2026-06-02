@@ -478,6 +478,80 @@ class TestGoalManager:
         assert decision["should_continue"] is False
         assert decision["verdict"] == "done"
 
+    def test_fresh_cited_gbrain_page_exists_checks_get_and_updated_after(
+        self,
+        hermes_home,
+        monkeypatch,
+    ):
+        from hermes_cli import goals
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            assert kwargs["cwd"] == "/tmp"
+            if args[:2] == ["gbrain", "get"]:
+                return subprocess.CompletedProcess(args, 0, "page body", "")
+            if args[:2] == ["gbrain", "list"]:
+                assert "--updated-after" in args
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    "proof-slug\tconcept\t2026-06-02\tProof Slug\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+        monkeypatch.setattr(goals.subprocess, "run", fake_run)
+
+        assert goals._fresh_cited_gbrain_page_exists(
+            "gbrain: proof-slug",
+            "2026-06-02T02:30:00+00:00",
+        )
+        assert calls[0][:3] == ["gbrain", "get", "proof-slug"]
+        assert calls[1][:2] == ["gbrain", "list"]
+
+    def test_manager_goal_allows_done_with_fresh_gbrain_receipt_for_kanban(
+        self,
+        hermes_home,
+        monkeypatch,
+    ):
+        from hermes_cli import goals
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.goals import GoalManager
+
+        kb.init_db()
+        kb.create_board("ludeme")
+        conn = kb.connect(board="ludeme")
+        try:
+            task_id = kb.create_task(conn, title="has gbrain proof", assignee="codexworker")
+        finally:
+            conn.close()
+
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "repair-blocked-task",
+                "board": "ludeme",
+                "task_id": task_id,
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        monkeypatch.setattr(goals, "_fresh_cited_gbrain_page_exists", lambda response, ts: True)
+        mgr = GoalManager(session_id="manager-fresh-gbrain-kanban-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh gbrain", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Progress for ludeme/{task_id} is recorded in gbrain: proof-slug"
+            )
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "done"
+
     def test_manager_goal_forces_continue_without_fresh_repo_auto_artifact(
         self,
         hermes_home,
@@ -544,6 +618,40 @@ class TestGoalManager:
         with patch.object(goals, "judge_goal", return_value=("done", "fresh .auto", False)):
             decision = mgr.evaluate_after_turn(
                 f"Fresh repo receipt for {repo}: {artifact}"
+            )
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "done"
+
+    def test_manager_goal_allows_done_with_fresh_gbrain_receipt_for_repo(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "inspect-run-attention",
+                "repo": str(repo),
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        monkeypatch.setattr(goals, "_fresh_cited_gbrain_page_exists", lambda response, ts: True)
+        mgr = GoalManager(session_id="manager-fresh-gbrain-repo-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh gbrain", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Fresh repo receipt for {repo}: gbrain page: proof-slug"
             )
 
         assert decision["should_continue"] is False
