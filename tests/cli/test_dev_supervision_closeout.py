@@ -125,6 +125,8 @@ def test_collect_closeout_writes_report_without_real_tmux_or_gbrain(tmp_path, mo
     assert "receipt.md" in text
     assert "Grade: `weak`" in text
     assert "pane prose is not proof" in text
+    assert "not a code-quality verdict" in text
+    assert "Codex must produce the merge/fix/blocked verdict" in text
     summary = telegram_summary(result)
     assert "Dev supervision closeout ready." in summary
     assert "worker: ludeme-codex:0.0" in summary

@@ -12,6 +12,7 @@ from hermes_cli.dev_manager_next_action import (
     collect_manager_packet,
     recommend_next_action,
     render_markdown,
+    telegram_cadence,
     telegram_summary,
     write_gbrain_page,
 )
@@ -146,9 +147,12 @@ def test_next_action_supervises_active_worker_before_stale_board_packets(isolate
     assert packet.next_action.kind == "supervise-interactive-worker"
     assert packet.next_action.worker == "ludeme-codex:0.0"
     summary = telegram_summary(packet)
-    assert "Human action: None by default" in summary
+    assert "Dev manager status: supervise-interactive-worker" in summary
+    assert "Human action: none" in summary
     assert "Command:" not in summary
-    assert "Interactive workers: 1" in summary
+    assert "Interactive workers: 1" not in summary
+    assert "fresh worker closeout/receipt" in summary
+    assert telegram_summary(packet, quiet_routine=True) == ""
 
 
 def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home):
@@ -175,11 +179,31 @@ def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home
     assert packet.next_action.task_id == high
     assert packet.next_action.task_id != low
     summary = telegram_summary(packet)
-    assert "Hermes next: dispatch-task" in summary
+    assert "Dev manager status: dispatch-task" in summary
     assert "Command:" not in summary
-    assert "Human action: None by default" in summary
-    assert "Evidence required:" in summary
-    assert "not copied from prior runs" in summary
+    assert "Human action: none" in summary
+    assert "Evidence:" in summary
+    assert "not copied from prior runs" not in summary
+    assert telegram_summary(packet, quiet_routine=True) == ""
+
+
+def test_telegram_summary_keeps_blockers_visible(isolated_kanban_home):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now, failing=True),
+        runs=[],
+        workers=[],
+    )
+
+    assert telegram_cadence(packet) == "blocked"
+    summary = telegram_summary(packet, quiet_routine=True)
+    assert "Dev manager blocked: fix-preflight" in summary
+    assert "Human action: Only if Hermes cannot repair" in summary
+    assert "Command:" not in summary
 
 
 def test_packet_json_includes_required_evidence(isolated_kanban_home):

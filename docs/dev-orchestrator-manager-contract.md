@@ -29,9 +29,10 @@ process after each run.
 - Claude is the design/product-plan critic only.
 
 Hermes may call any of these tools, but it must preserve the role split. A
-Claude pass that writes implementation code is a bug. A Codex run that skips
-gbrain context or durable closeout is incomplete. A Hermes reminder that asks
-the human to run a routine command is a manager failure.
+Claude pass that writes implementation code is a bug. A Hermes-authored code
+review verdict is a bug. A Codex run that skips gbrain context or durable
+closeout is incomplete. A Hermes reminder that asks the human to run a routine
+command is a manager failure.
 
 ## Operating Loop
 
@@ -45,8 +46,10 @@ For every active campaign, Hermes should repeatedly run this loop:
 3. Act through the right channel: Telegram-facing Hermes for human dialogue,
    tmux for interactive workers, autodev for structured workflow, gbrain for
    durable memory, git/GitHub for landed code.
-4. Verify evidence before claiming progress: command output, test results,
-   artifacts, commits, PRs, dashboard state, or gbrain pages.
+4. Verify that evidence exists before claiming progress: command output, test
+   results, artifacts, commits, PRs, dashboard state, or gbrain pages. For code
+   quality and merge-readiness, dispatch Codex as the reviewer and relay its
+   verdict rather than writing one as Hermes.
 5. Teach and summarize: produce concise Telegram status, durable gbrain
    closeout, and lessons that make the next run easier.
 6. Improve the system: remove the most painful manual step or weak contract
@@ -80,6 +83,8 @@ These are explicitly not the desired product:
 - Creating aliases or handlers whose main value is labeling tmux sessions.
 - Treating cron output as management.
 - Treating artifacts as proof without checking whether they changed behavior.
+- Letting Hermes write implementation or code-review judgments instead of
+  dispatching Codex for those roles.
 - Starting new workers while an existing worker is active but uninspected.
 - Letting stale Kanban state outrank live tmux/Codex/autodev state.
 - Asking the human for input when Hermes can inspect, steer, validate, or close
@@ -134,8 +139,29 @@ The evidence grade has operational meaning:
 - `receipt-backed`: a fresh receipt exists, but it has no recognized status.
 - `weak`: no machine-readable receipt exists.
 
-Only `verified` should be summarized as passed. Anything else is a handoff,
-investigation, or follow-up state.
+Only `verified` should be summarized as receipt-backed run evidence. It is not
+a code-quality or merge-readiness verdict. Implementation work still needs a
+Codex review pass that reads the receipts, diff, tests, and commits and returns
+the merge/fix/blocked decision.
+
+## Telegram Cadence
+
+Telegram is the operator surface, not a live log. Hermes should stay quiet
+unless a message helps the human make a decision or understand a finished run.
+
+Default outbound shape:
+
+- one sentence naming the state: `status`, `decision`, `blocked`, or `finished`;
+- one `Hermes next` line;
+- one `Human action` line, usually `none`;
+- one short evidence line;
+- one report or artifact path when detail is needed.
+
+Routine status packets should be suppressible. If Hermes can inspect, steer,
+validate, close out, or dispatch a Codex reviewer itself, the Telegram message
+should either be silent or say that no human action is required. Ask at most one
+decision question, with the recommended answer first, only when the blocker is
+truly outside Hermes authority.
 
 ## Current Highest-Impact Improvements
 

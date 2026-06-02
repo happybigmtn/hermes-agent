@@ -42,6 +42,17 @@ from hermes_cli.dev_run_status import (
 
 DEFAULT_GBRAIN_SLUG = "dev-orchestrator-manager-next-action"
 ACTIONABLE_STATUSES = {"running", "blocked", "review", "ready", "todo", "triage"}
+ROUTINE_TELEGRAM_KINDS = {
+    "supervise-interactive-worker",
+    "repair-blocked-task",
+    "inspect-stale-task",
+    "inspect-run-attention",
+    "run-review",
+    "dispatch-task",
+    "wait-for-active-run",
+    "execute-plan-slice",
+    "create-campaign-plan",
+}
 
 
 @dataclass(frozen=True)
@@ -570,18 +581,38 @@ def write_packet_report(
     return packet
 
 
-def telegram_summary(packet: ManagerPacket) -> str:
+def telegram_cadence(packet: ManagerPacket) -> str:
+    if packet.next_action.kind == "fix-preflight":
+        return "blocked"
+    human_action = packet.next_action.human_action()
+    if not human_action.startswith("None by default") and not human_action.startswith("Only if"):
+        return "decision"
+    return "status"
+
+
+def _evidence_short(packet: ManagerPacket) -> str:
+    timestamp = packet.generated_at.isoformat()
+    action = packet.next_action
+    if action.worker:
+        return f"fresh worker closeout/receipt after {timestamp}"
+    if action.board and action.task_id:
+        return f"fresh receipt/comment/commit for {action.board}/{action.task_id} after {timestamp}"
+    if action.repo:
+        return f"fresh run artifact/commit/gbrain page for {action.repo} after {timestamp}"
+    return f"fresh receipt/artifact/commit after {timestamp}"
+
+
+def telegram_summary(packet: ManagerPacket, *, quiet_routine: bool = False) -> str:
+    cadence = telegram_cadence(packet)
+    if quiet_routine and cadence == "status" and packet.next_action.kind in ROUTINE_TELEGRAM_KINDS:
+        return ""
+    human_action = packet.next_action.human_action()
+    human_line = "Human action: none" if human_action.startswith("None by default") else f"Human action: {human_action}"
     lines = [
-        "Dev manager supervision tick ready.",
-        f"Hermes next: {packet.next_action.kind}",
-        f"Why: {packet.next_action.reason}",
-        f"Manager instruction: {packet.next_action.manager_instruction()}",
-        f"Human action: {packet.next_action.human_action()}",
-        f"Evidence required: {packet.next_action.evidence_requirement(evidence_after=packet.generated_at)}",
-        f"Preflight failures: {packet.preflight.failure_count}",
-        f"Interactive workers: {packet.worker_count}",
-        f"Blocked tasks: {packet.blocked_count}",
-        f"Running tasks: {packet.running_count}",
+        f"Dev manager {cadence}: {packet.next_action.kind} - {packet.next_action.reason}",
+        f"Hermes next: {packet.next_action.manager_instruction()}",
+        human_line,
+        f"Evidence: {_evidence_short(packet)}",
     ]
     if packet.markdown_path:
         lines.append(f"Report: {packet.markdown_path}")
@@ -657,6 +688,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gbrain-slug", default=os.getenv("HERMES_DEV_MANAGER_GBRAIN_SLUG", DEFAULT_GBRAIN_SLUG))
     parser.add_argument("--no-gbrain", action="store_true")
     parser.add_argument("--json", action="store_true", help="Print machine-readable packet JSON instead of Telegram summary")
+    parser.add_argument(
+        "--quiet-routine",
+        action="store_true",
+        default=os.getenv("HERMES_DEV_MANAGER_QUIET_ROUTINE", "").lower() in {"1", "true", "yes", "on"},
+        help="Print nothing for routine self-managed status packets",
+    )
     parser.add_argument("--profile", action="append", default=None, help="Preflight profile to check; repeatable")
     return parser
 
@@ -685,7 +722,12 @@ def main(argv: list[str] | None = None) -> int:
         write_gbrain=not args.no_gbrain,
         gbrain_slug=args.gbrain_slug,
     )
-    print(packet_to_json(packet) if args.json else telegram_summary(packet))
+    if args.json:
+        print(packet_to_json(packet))
+    else:
+        summary = telegram_summary(packet, quiet_routine=args.quiet_routine)
+        if summary:
+            print(summary)
     return 0
 
 
