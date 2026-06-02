@@ -226,13 +226,17 @@ def test_repo_only_process_attaches_to_newest_run_only(tmp_path):
     assert by_id["old"].implementation_plan is None
 
 
-def test_generate_status_report_writes_markdown_and_summary(tmp_path):
+def test_generate_status_report_writes_markdown_and_summary(tmp_path, monkeypatch):
     repo_root = tmp_path / "repos"
     repo = repo_root / "demo"
     _init_repo(repo)
     run_root = repo / ".auto" / "orchestrator" / "run1"
     run_root.mkdir(parents=True)
     (run_root / "run.env").write_text("RUN_ID=run1\nREPO_SLUG=demo\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.dev_run_status.worker_manager_event_lines",
+        lambda sessions: {"demo-codex:0.0": ["`2026-06-02T00:00:00+00:00` `worker-start` demo intent"]},
+    )
 
     now = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
     result = generate_status_report(
@@ -264,8 +268,11 @@ def test_generate_status_report_writes_markdown_and_summary(tmp_path):
     assert "Dev Orchestrator Active Run Status" in text
     assert "Interactive tmux workers: 1" in text
     assert "demo-codex:0.0" in text
+    assert "Manager event:" in text
+    assert "demo intent" in text
     assert result.dashboard_path is not None
     assert result.dashboard_path.exists()
+    assert "manager event" in result.dashboard_path.read_text(encoding="utf-8")
     summary = telegram_summary(result)
     assert "Active runs: 0" in summary
     assert "Interactive workers: 1" in summary

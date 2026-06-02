@@ -661,6 +661,28 @@ def default_dashboard_url() -> str | None:
     return f"http://{ip}:{DEFAULT_DASHBOARD_PORT}/{DEFAULT_DASHBOARD_FILENAME}"
 
 
+def worker_manager_event_lines(
+    worker_sessions: Sequence[WorkerSession],
+    *,
+    limit_per_worker: int = 1,
+) -> dict[str, list[str]]:
+    try:
+        from hermes_cli.dev_manager_events import matching_events, render_event_line
+    except Exception:
+        return {}
+
+    event_lines: dict[str, list[str]] = {}
+    for session in worker_sessions:
+        events = matching_events(
+            repo=session.current_path,
+            worker_session=session.target(),
+            limit=limit_per_worker,
+        )
+        if events:
+            event_lines[session.target()] = [render_event_line(event) for event in events]
+    return event_lines
+
+
 def render_dashboard_html(
     runs: Sequence[RunSummary],
     worker_sessions: Sequence[WorkerSession],
@@ -672,10 +694,12 @@ def render_dashboard_html(
     active_runs = sum(1 for run in runs if run.active)
     attention = sum(1 for run in runs if run.attention)
     live_workers = sum(1 for session in worker_sessions if not session.dead)
+    manager_events = worker_manager_event_lines(worker_sessions)
     worker_rows: list[str] = []
     for session in worker_sessions:
         state = "dead" if session.dead else "active" if session.active else "idle"
         steer = f"tmux send-keys -t {session.target()} '<message>' C-m"
+        event_text = "\n".join(manager_events.get(session.target(), [])) or "none"
         worker_rows.append(
             "<tr>"
             f"<td>{html.escape(session.target())}</td>"
@@ -683,11 +707,12 @@ def render_dashboard_html(
             f"<td>{html.escape(state)}</td>"
             f"<td>{html.escape(session.current_command or 'unknown')}</td>"
             f"<td>{html.escape(str(session.current_path or 'unknown'))}</td>"
+            f"<td>{html.escape(event_text)}</td>"
             f"<td><code>{html.escape(steer)}</code></td>"
             "</tr>"
         )
     if not worker_rows:
-        worker_rows.append('<tr><td colspan="6">No supervised tmux worker panes found.</td></tr>')
+        worker_rows.append('<tr><td colspan="7">No supervised tmux worker panes found.</td></tr>')
 
     run_rows: list[str] = []
     for run in runs[:12]:
@@ -741,7 +766,7 @@ def render_dashboard_html(
     <div class="metric"><span>tmux workers</span><strong>{live_workers}</strong></div>
   </section>
   <h2>Interactive Workers</h2>
-  <table><thead><tr><th>target</th><th>kind</th><th>state</th><th>command</th><th>path</th><th>steer</th></tr></thead><tbody>{''.join(worker_rows)}</tbody></table>
+  <table><thead><tr><th>target</th><th>kind</th><th>state</th><th>command</th><th>path</th><th>manager event</th><th>steer</th></tr></thead><tbody>{''.join(worker_rows)}</tbody></table>
   <h2>Autodev Runs</h2>
   <table><thead><tr><th>repo</th><th>run</th><th>state</th><th>phase</th><th>latest artifact</th><th>next action</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table>
   <h2>Markdown Report</h2>
@@ -774,6 +799,7 @@ def render_markdown(
     if dashboard_url:
         lines.extend([f"Dashboard: {dashboard_url}", ""])
     lines.extend(["## Interactive Workers", ""])
+    manager_events = worker_manager_event_lines(worker_sessions)
     if worker_sessions:
         for session in worker_sessions:
             state = "dead" if session.dead else "active" if session.active else "idle"
@@ -781,6 +807,12 @@ def render_markdown(
             lines.append(
                 f"- `{session.target()}` {session.kind()} {state}; repo={repo}; command=`{session.current_command or 'unknown'}`; path=`{session.current_path or 'unknown'}`"
             )
+            events = manager_events.get(session.target(), [])
+            if events:
+                for event in events:
+                    lines.append(f"  Manager event: {event}")
+            else:
+                lines.append("  Manager event: none")
             lines.append(f"  Steer: `tmux send-keys -t {session.target()} '<message>' C-m`")
     else:
         lines.append("No supervised tmux worker panes found.")
