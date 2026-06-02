@@ -446,6 +446,13 @@ def _has_fresh_kanban_receipt(*, board: str, task_id: str, evidence_after_epoch:
 
 _GIT_COMMIT_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
 _AUTO_PATH_RE = re.compile(r"(?P<path>(?:~|/|\.{1,2}/)?[^\s`'\"<>]*\.auto/[^\s`'\"<>]+)")
+_GITHUB_PR_URL_RE = re.compile(
+    r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>\d+)"
+)
+_GITHUB_REMOTE_RE = re.compile(
+    r"github\.com[:/](?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?(?:\s|$)"
+)
 _GBRAIN_GET_RE = re.compile(r"\bgbrain\s+get\s+[`'\"]?(?P<slug>[a-zA-Z0-9][a-zA-Z0-9_./-]{1,200})")
 _GBRAIN_LABEL_RE = re.compile(
     r"\bgbrain(?:\s+(?:page|slug|closeout|receipt))?\s*[:=]\s*[`'\"]?"
@@ -489,7 +496,92 @@ def _cited_auto_artifact_paths(repo_path: Path, response: str) -> list[Path]:
 def _response_cites_repo_receipt(response: str, repo_path: Path) -> bool:
     return bool(_cited_auto_artifact_paths(repo_path, response)) or bool(
         _GIT_COMMIT_RE.search(response or "")
+    ) or bool(
+        _cited_github_pr_urls(response)
     )
+
+
+def _cited_github_pr_urls(response: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _GITHUB_PR_URL_RE.finditer(response or ""):
+        url = match.group(0).rstrip(_PATH_TRAILING_PUNCT)
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _github_repo_name_from_pr_url(url: str) -> Optional[str]:
+    match = _GITHUB_PR_URL_RE.search(url)
+    if not match:
+        return None
+    return f"{match.group('owner')}/{match.group('repo')}".casefold()
+
+
+def _github_remote_repo_names(repo_path: Path) -> set[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+    names: set[str] = set()
+    for match in _GITHUB_REMOTE_RE.finditer(result.stdout or ""):
+        names.add(f"{match.group('owner')}/{match.group('repo')}".casefold())
+    return names
+
+
+def _fresh_cited_github_pr_exists(
+    repo_path: Path,
+    response: str,
+    evidence_after_epoch: int,
+) -> bool:
+    urls = _cited_github_pr_urls(response)
+    if not urls:
+        return False
+    repo_names = _github_remote_repo_names(repo_path)
+    if not repo_names:
+        return False
+    for url in urls[:10]:
+        pr_repo = _github_repo_name_from_pr_url(url)
+        if not pr_repo or pr_repo not in repo_names:
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    url,
+                    "--json",
+                    "url,number,state,createdAt,updatedAt,mergedAt,closedAt",
+                ],
+                cwd="/tmp",
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            continue
+        for key in ("updatedAt", "createdAt", "mergedAt", "closedAt"):
+            ts = _parse_packet_epoch(data.get(key))
+            if ts is not None and ts >= evidence_after_epoch:
+                return True
+    return False
 
 
 def _cited_gbrain_slugs(response: str) -> list[str]:
@@ -591,7 +683,15 @@ def _has_fresh_repo_receipt(
         evidence_after_epoch,
     ):
         return True
-    return _fresh_cited_git_commit_exists(repo_path, response, evidence_after_epoch)
+    return _fresh_cited_git_commit_exists(
+        repo_path,
+        response,
+        evidence_after_epoch,
+    ) or _fresh_cited_github_pr_exists(
+        repo_path,
+        response,
+        evidence_after_epoch,
+    )
 
 
 def _dev_manager_machine_receipt_failure(
@@ -658,7 +758,7 @@ def _dev_manager_machine_receipt_failure(
         return (
             "dev-manager receipt check failed: response did not cite a "
             f"machine-verifiable repo receipt for `{repo}`; cite a fresh `.auto` "
-            "artifact path, git commit hash, or gbrain page slug"
+            "artifact path, git commit hash, GitHub PR URL, or gbrain page slug"
         )
     try:
         if _has_fresh_repo_receipt(
@@ -675,7 +775,8 @@ def _dev_manager_machine_receipt_failure(
         return None
     return (
         "dev-manager receipt check failed: no fresh machine-verifiable repo "
-        f"artifact, cited git commit, or gbrain page was found for `{repo}` at or after "
+        "artifact, cited git commit, GitHub PR, or gbrain page was found for "
+        f"`{repo}` at or after "
         f"`{next_action.get('evidence_after') or packet.get('generated_at')}`"
     )
 

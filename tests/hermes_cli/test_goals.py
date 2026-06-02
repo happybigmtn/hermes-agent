@@ -755,6 +755,92 @@ class TestGoalManager:
         assert decision["should_continue"] is False
         assert decision["verdict"] == "done"
 
+    def test_fresh_cited_github_pr_exists_checks_repo_and_updated_at(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        response = "PR receipt: https://github.com/happybigmtn/hermes-agent/pull/123"
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:4] == ["git", "-C", str(repo), "remote"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    "fork\tgit@github.com:happybigmtn/hermes-agent.git (fetch)\n",
+                    "",
+                )
+            if args[:3] == ["gh", "pr", "view"]:
+                assert kwargs["cwd"] == "/tmp"
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    json.dumps(
+                        {
+                            "url": "https://github.com/happybigmtn/hermes-agent/pull/123",
+                            "updatedAt": datetime.now(timezone.utc).isoformat(),
+                            "createdAt": evidence_after.isoformat(),
+                            "mergedAt": None,
+                            "closedAt": None,
+                            "state": "OPEN",
+                            "number": 123,
+                        }
+                    ),
+                    "",
+                )
+            return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+        monkeypatch.setattr(goals.subprocess, "run", fake_run)
+
+        assert goals._fresh_cited_github_pr_exists(
+            repo,
+            response,
+            int(evidence_after.timestamp()),
+        )
+        assert any(call[0][:3] == ["gh", "pr", "view"] for call in calls)
+
+    def test_manager_goal_allows_done_with_fresh_github_pr_receipt(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "inspect-run-attention",
+                "repo": str(repo),
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        monkeypatch.setattr(goals, "_fresh_cited_github_pr_exists", lambda repo_path, response, ts: True)
+        mgr = GoalManager(session_id="manager-fresh-github-pr-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh PR", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Fresh repo receipt for {repo}: https://github.com/happybigmtn/hermes-agent/pull/123"
+            )
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "done"
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
