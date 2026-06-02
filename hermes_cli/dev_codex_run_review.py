@@ -1,8 +1,8 @@
 """Dispatch a Codex-only review pass for a supervised dev run.
 
 Hermes owns orchestration. Codex owns implementation and code review. This
-module prepares the review packet, invokes ``codex review``, and stores the
-resulting artifacts without Hermes inventing a merge-readiness verdict.
+module prepares the review packet, invokes ``codex exec review``, and stores
+the resulting artifacts without Hermes inventing a merge-readiness verdict.
 """
 
 from __future__ import annotations
@@ -88,12 +88,16 @@ def _run_review_command(
             timeout=timeout,
             check=False,
         )
-        return CommandResult(tuple(args), result.returncode, result.stdout.strip(), result.stderr.strip())
+        return CommandResult(
+            tuple(args), result.returncode, result.stdout.strip(), result.stderr.strip()
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return CommandResult(tuple(args), 127, "", str(exc))
 
 
-def _review_target_args(*, base: str | None, commit: str | None, title: str | None) -> list[str]:
+def _review_target_args(
+    *, base: str | None, commit: str | None, title: str | None
+) -> list[str]:
     if commit:
         args = ["--commit", commit]
         if title:
@@ -102,11 +106,6 @@ def _review_target_args(*, base: str | None, commit: str | None, title: str | No
     if base:
         return ["--base", base]
     return ["--uncommitted"]
-
-
-def _review_accepts_prompt(*, commit: str | None) -> bool:
-    # Codex CLI rejects `codex review --commit <sha> [PROMPT]`.
-    return commit is None
 
 
 def build_review_prompt(
@@ -120,7 +119,13 @@ def build_review_prompt(
         f"- {receipt.path} status={receipt.status or 'unknown'} modified={receipt.modified_at.isoformat()}"
         for receipt in closeout.evidence_grade.receipts
     ]
-    target = f"commit {commit}" if commit else f"base {base}" if base else "uncommitted changes"
+    target = (
+        f"commit {commit}"
+        if commit
+        else f"base {base}"
+        if base
+        else "uncommitted changes"
+    )
     lines = [
         "You are Codex acting only as an independent code reviewer.",
         "",
@@ -148,16 +153,14 @@ def build_review_prompt(
         "Machine receipts:",
     ]
     lines.extend(receipt_paths or ["- none"])
-    lines.extend(
-        [
-            "",
-            "Review rules:",
-            "- Base the verdict on the diff/commit, receipt grade, tests/checks, and closeout artifact.",
-            "- Treat weak, stale, or failed receipt evidence as not ready unless there is no implementation delta.",
-            "- Flag missing tests, unsafe behavior, role-boundary violations, and uncommitted changes.",
-            "- Keep the answer short enough to read on Telegram.",
-        ]
-    )
+    lines.extend([
+        "",
+        "Review rules:",
+        "- Base the verdict on the diff/commit, receipt grade, tests/checks, and closeout artifact.",
+        "- Treat weak, stale, or failed receipt evidence as not ready unless there is no implementation delta.",
+        "- Flag missing tests, unsafe behavior, role-boundary violations, and uncommitted changes.",
+        "- Keep the answer short enough to read on Telegram.",
+    ])
     if extra_instructions:
         lines.extend(["", "Extra instructions:", extra_instructions.strip()])
     return "\n".join(lines).rstrip() + "\n"
@@ -204,7 +207,10 @@ def run_codex_review(
 ) -> CodexReviewResult:
     repo = repo.expanduser().resolve()
     stamp = generated_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = out_dir.expanduser() / f"codex-run-review-{_slugify(repo.name)}-{_slugify(session)}-{stamp}"
+    run_dir = (
+        out_dir.expanduser()
+        / f"codex-run-review-{_slugify(repo.name)}-{_slugify(session)}-{stamp}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     closeout = collect_closeout(
         repo=repo,
@@ -224,14 +230,17 @@ def run_codex_review(
     prompt_path = run_dir / "codex-review-prompt.md"
     output_path = run_dir / "codex-review-output.md"
     prompt_path.write_text(prompt, encoding="utf-8")
-    accepts_prompt = _review_accepts_prompt(commit=commit)
-    args = ["codex", "review", *_review_target_args(base=base, commit=commit, title=title)]
-    if accepts_prompt:
-        args.append("-")
+    args = [
+        "codex",
+        "exec",
+        "review",
+        *_review_target_args(base=base, commit=commit, title=title),
+        "-",
+    ]
     command_result = _run_review_command(
         args,
         cwd=repo,
-        prompt=prompt if accepts_prompt else None,
+        prompt=prompt,
         timeout=timeout,
     )
     write_review_output(output_path, result=command_result)
@@ -294,36 +303,65 @@ def telegram_summary(result: CodexReviewResult) -> str:
         lines.append(confidence)
     if review_line:
         lines.append(f"review: {review_line}")
-    lines.extend(
-        [
-            f"receipt grade: {result.closeout.evidence_grade.grade}",
-            f"output: {result.output_path}",
-            f"prompt: {result.prompt_path}",
-            f"closeout: {result.closeout.markdown_path}",
-            f"event: {result.event.id}",
-        ]
-    )
+    lines.extend([
+        f"receipt grade: {result.closeout.evidence_grade.grade}",
+        f"output: {result.output_path}",
+        f"prompt: {result.prompt_path}",
+        f"closeout: {result.closeout.markdown_path}",
+        f"event: {result.event.id}",
+    ])
     if not result.ok:
-        lines.append(f"attention: codex review command returned {result.command_result.returncode}")
+        lines.append(
+            f"attention: codex review command returned {result.command_result.returncode}"
+        )
     return "\n".join(lines)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a Codex-only review pass for a supervised dev run")
+    parser = argparse.ArgumentParser(
+        description="Run a Codex-only review pass for a supervised dev run"
+    )
     parser.add_argument("--repo", required=True)
     parser.add_argument("--session", required=True)
-    parser.add_argument("--out-dir", default=os.getenv("HERMES_CODEX_RUN_REVIEW_DIR", str(DEFAULT_REPORT_DIR)))
-    parser.add_argument("--event-log", default=os.getenv("HERMES_DEV_MANAGER_EVENT_LOG", str(DEFAULT_EVENT_LOG)))
+    parser.add_argument(
+        "--out-dir",
+        default=os.getenv("HERMES_CODEX_RUN_REVIEW_DIR", str(DEFAULT_REPORT_DIR)),
+    )
+    parser.add_argument(
+        "--event-log",
+        default=os.getenv("HERMES_DEV_MANAGER_EVENT_LOG", str(DEFAULT_EVENT_LOG)),
+    )
     parser.add_argument("--base")
     parser.add_argument("--commit")
     parser.add_argument("--title")
     parser.add_argument("--instructions")
     parser.add_argument("--instructions-file")
-    parser.add_argument("--capture-lines", type=int, default=int(os.getenv("HERMES_CODEX_RUN_REVIEW_CAPTURE_LINES", DEFAULT_CAPTURE_LINES)))
-    parser.add_argument("--timeout", type=int, default=int(os.getenv("HERMES_CODEX_RUN_REVIEW_TIMEOUT", "900")))
-    parser.add_argument("--timezone", default=os.getenv("HERMES_CODEX_RUN_REVIEW_TIMEZONE", DEFAULT_TIMEZONE))
-    parser.add_argument("--requested-by", default=os.getenv("HERMES_DEV_MANAGER_REQUESTED_BY", DEFAULT_REQUESTED_BY))
-    parser.add_argument("--delivery-channel", default=os.getenv("HERMES_DEV_MANAGER_DELIVERY_CHANNEL", DEFAULT_DELIVERY_CHANNEL))
+    parser.add_argument(
+        "--capture-lines",
+        type=int,
+        default=int(
+            os.getenv("HERMES_CODEX_RUN_REVIEW_CAPTURE_LINES", DEFAULT_CAPTURE_LINES)
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.getenv("HERMES_CODEX_RUN_REVIEW_TIMEOUT", "900")),
+    )
+    parser.add_argument(
+        "--timezone",
+        default=os.getenv("HERMES_CODEX_RUN_REVIEW_TIMEZONE", DEFAULT_TIMEZONE),
+    )
+    parser.add_argument(
+        "--requested-by",
+        default=os.getenv("HERMES_DEV_MANAGER_REQUESTED_BY", DEFAULT_REQUESTED_BY),
+    )
+    parser.add_argument(
+        "--delivery-channel",
+        default=os.getenv(
+            "HERMES_DEV_MANAGER_DELIVERY_CHANNEL", DEFAULT_DELIVERY_CHANNEL
+        ),
+    )
     return parser
 
 
@@ -331,7 +369,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     instructions = args.instructions
     if args.instructions_file:
-        instructions = Path(args.instructions_file).expanduser().read_text(encoding="utf-8")
+        instructions = (
+            Path(args.instructions_file).expanduser().read_text(encoding="utf-8")
+        )
     now = datetime.now(timezone.utc).astimezone(_timezone(args.timezone))
     result = run_codex_review(
         repo=Path(args.repo),

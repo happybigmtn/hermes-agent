@@ -16,11 +16,15 @@ from hermes_cli.dev_supervision_closeout import CommandResult
 def _init_repo(path: Path) -> None:
     path.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "r@example.com"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "r@example.com"], cwd=path, check=True
+    )
     subprocess.run(["git", "config", "user.name", "R"], cwd=path, check=True)
     (path / "README.md").write_text("demo\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True
+    )
 
 
 def test_run_codex_review_writes_artifacts_and_records_event(tmp_path, monkeypatch):
@@ -33,7 +37,10 @@ def test_run_codex_review_writes_artifacts_and_records_event(tmp_path, monkeypat
     event_log = tmp_path / "events.jsonl"
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr("hermes_cli.dev_supervision_closeout.capture_pane", lambda target, lines: ["worker done"])
+    monkeypatch.setattr(
+        "hermes_cli.dev_supervision_closeout.capture_pane",
+        lambda target, lines: ["worker done"],
+    )
 
     def fake_run_review_command(args, *, cwd, prompt, timeout):
         captured["args"] = args
@@ -47,7 +54,9 @@ def test_run_codex_review_writes_artifacts_and_records_event(tmp_path, monkeypat
             "",
         )
 
-    monkeypatch.setattr("hermes_cli.dev_codex_run_review._run_review_command", fake_run_review_command)
+    monkeypatch.setattr(
+        "hermes_cli.dev_codex_run_review._run_review_command", fake_run_review_command
+    )
 
     result = run_codex_review(
         repo=repo,
@@ -58,7 +67,7 @@ def test_run_codex_review_writes_artifacts_and_records_event(tmp_path, monkeypat
         timeout=123,
     )
 
-    assert captured["args"] == ["codex", "review", "--uncommitted", "-"]
+    assert captured["args"] == ["codex", "exec", "review", "--uncommitted", "-"]
     assert captured["cwd"] == repo
     assert captured["timeout"] == 123
     assert "Hermes is the orchestrator" in str(captured["prompt"])
@@ -81,14 +90,20 @@ def test_run_codex_review_can_target_commit_with_title(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_repo(repo)
     captured: dict[str, object] = {}
-    monkeypatch.setattr("hermes_cli.dev_supervision_closeout.capture_pane", lambda target, lines: [])
+    monkeypatch.setattr(
+        "hermes_cli.dev_supervision_closeout.capture_pane", lambda target, lines: []
+    )
 
     def fake_run_review_command(args, *, cwd, prompt, timeout):
         captured["args"] = args
         captured["prompt"] = prompt
-        return CommandResult(tuple(args), 0, "Verdict: READY_TO_MERGE\nConfidence: medium", "")
+        return CommandResult(
+            tuple(args), 0, "Verdict: READY_TO_MERGE\nConfidence: medium", ""
+        )
 
-    monkeypatch.setattr("hermes_cli.dev_codex_run_review._run_review_command", fake_run_review_command)
+    monkeypatch.setattr(
+        "hermes_cli.dev_codex_run_review._run_review_command", fake_run_review_command
+    )
 
     run_codex_review(
         repo=repo,
@@ -100,8 +115,18 @@ def test_run_codex_review_can_target_commit_with_title(tmp_path, monkeypatch):
         title="demo commit",
     )
 
-    assert captured["args"] == ["codex", "review", "--commit", "abc123", "--title", "demo commit"]
-    assert captured["prompt"] is None
+    assert captured["args"] == [
+        "codex",
+        "exec",
+        "review",
+        "--commit",
+        "abc123",
+        "--title",
+        "demo commit",
+        "-",
+    ]
+    assert "Hermes is the orchestrator" in str(captured["prompt"])
+    assert "Target: commit abc123" in str(captured["prompt"])
 
 
 def test_telegram_summary_relays_native_commit_review_line(tmp_path):
@@ -124,4 +149,6 @@ def test_telegram_summary_relays_native_commit_review_line(tmp_path):
         event=SimpleNamespace(id="evt1"),
     )
 
-    assert "review: No actionable correctness issues were found." in telegram_summary(result)
+    assert "review: No actionable correctness issues were found." in telegram_summary(
+        result
+    )

@@ -170,7 +170,9 @@ action preserves the role split and writes durable artifacts. The first allowed
 safe action is `codex-review-worker`: if a supervised Codex worker has a latest
 commit without a newer `codex-review` event, or its pane contains an explicit
 review-ready marker and no newer `codex-review` event exists, Hermes may run
-the Codex review gate and relay Codex's verdict. Hermes must not generalize
+the Codex review gate and relay Codex's verdict. The gate must pass the saved
+structured review prompt to Codex for both commit and uncommitted targets.
+Hermes must not generalize
 this into arbitrary shell execution without a new contract.
 
 ## Current Highest-Impact Improvements
