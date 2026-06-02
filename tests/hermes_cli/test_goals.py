@@ -335,6 +335,43 @@ class TestGoalManager:
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
 
+    def test_dev_manager_goal_preflight_profile_gate(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+
+        monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+        monkeypatch.delenv("HERMES_DEV_MANAGER_GOAL_PREFLIGHT", raising=False)
+        assert goals._dev_manager_goal_preflight_enabled() is True
+
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        assert goals._dev_manager_goal_preflight_enabled() is False
+
+        monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+        monkeypatch.setenv("HERMES_DEV_MANAGER_GOAL_PREFLIGHT", "0")
+        assert goals._dev_manager_goal_preflight_enabled() is False
+
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        monkeypatch.setenv("HERMES_DEV_MANAGER_GOAL_PREFLIGHT", "1")
+        assert goals._dev_manager_goal_preflight_enabled() is True
+
+    def test_continuation_prompt_includes_dev_manager_packet(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        monkeypatch.setattr(
+            goals,
+            "_dev_manager_next_action_context",
+            lambda: "[Dev manager next-action preflight]\npacket-json\n\n",
+        )
+        mgr = GoalManager(session_id="manager-cont-sid")
+        mgr.set("keep improving the orchestrator")
+
+        prompt = mgr.next_continuation_prompt()
+
+        assert prompt is not None
+        assert prompt.startswith("[Dev manager next-action preflight]")
+        assert "packet-json" in prompt
+        assert "Goal: keep improving the orchestrator" in prompt
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired

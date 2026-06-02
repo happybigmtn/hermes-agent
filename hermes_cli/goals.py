@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,10 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # exhausted with every reply shaped like `judge returned empty response` or
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
+DEV_MANAGER_GOAL_PREFLIGHT_ENV = "HERMES_DEV_MANAGER_GOAL_PREFLIGHT"
+DEV_MANAGER_GOAL_PROFILES_ENV = "HERMES_DEV_MANAGER_GOAL_PROFILES"
+DEFAULT_DEV_MANAGER_GOAL_PROFILES = {"orchestrator"}
+_DEV_MANAGER_PACKET_MAX_CHARS = 6000
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -89,6 +94,16 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "additional criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
     "and stop."
+)
+
+
+DEV_MANAGER_GOAL_PREFLIGHT_TEMPLATE = (
+    "[Dev manager next-action preflight]\n"
+    "This session is running under a development-manager profile. Before "
+    "taking a broad or open-ended step, read this authoritative state packet. "
+    "Follow `next_action` unless you have a concrete, state-based reason to "
+    "diverge; if you diverge, state the reason explicitly.\n"
+    "{packet}\n\n"
 )
 
 
@@ -290,6 +305,66 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "… [truncated]"
+
+
+def _csv_set(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {part.strip().casefold() for part in value.split(",") if part.strip()}
+
+
+def _dev_manager_goal_preflight_enabled() -> bool:
+    """Return True when goal continuations should include manager state."""
+    raw = os.environ.get(DEV_MANAGER_GOAL_PREFLIGHT_ENV)
+    if raw is not None:
+        value = raw.strip().casefold()
+        if value in {"1", "true", "yes", "on", "force"}:
+            return True
+        if value in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip().casefold()
+    if not profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = (get_active_profile_name() or "").strip().casefold()
+        except Exception:
+            profile = ""
+    enabled_profiles = _csv_set(os.environ.get(DEV_MANAGER_GOAL_PROFILES_ENV)) or DEFAULT_DEV_MANAGER_GOAL_PROFILES
+    return bool(profile and profile in enabled_profiles)
+
+
+def _dev_manager_next_action_context() -> Optional[str]:
+    """Return a compact manager state packet for orchestrator goal prompts.
+
+    This is deliberately fail-open. The goal loop should continue even if
+    Kanban/gbrain/preflight state is temporarily unreadable; in that case the
+    agent gets no prefix rather than a broken continuation.
+    """
+    if not _dev_manager_goal_preflight_enabled():
+        return None
+    try:
+        from hermes_cli.dev_manager_next_action import collect_manager_packet, packet_to_json
+        from hermes_cli.dev_run_status import (
+            DEFAULT_RECENT_HOURS,
+            DEFAULT_REPO_ROOTS,
+            DEFAULT_STALE_MINUTES,
+        )
+
+        now = datetime.now(timezone.utc)
+        packet = collect_manager_packet(
+            now=now,
+            repo_roots=DEFAULT_REPO_ROOTS,
+            stale_after=timedelta(minutes=DEFAULT_STALE_MINUTES),
+            recent_after=now - timedelta(hours=DEFAULT_RECENT_HOURS),
+        )
+        rendered = packet_to_json(packet)
+        rendered = _truncate(rendered, _DEV_MANAGER_PACKET_MAX_CHARS)
+        return DEV_MANAGER_GOAL_PREFLIGHT_TEMPLATE.format(packet=rendered)
+    except Exception as exc:
+        logger.debug("dev manager goal preflight unavailable: %s", exc)
+        return None
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -740,11 +815,16 @@ class GoalManager:
         if not self._state or self._state.status != "active":
             return None
         if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        manager_context = _dev_manager_next_action_context()
+        if manager_context:
+            return manager_context + prompt
+        return prompt
 
 
 # ──────────────────────────────────────────────────────────────────────
