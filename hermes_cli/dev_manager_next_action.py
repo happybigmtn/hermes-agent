@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -112,6 +113,8 @@ class NextAction:
     task_id: str | None = None
     repo: str | None = None
     worker: str | None = None
+    review_commit: str | None = None
+    review_title: str | None = None
     required_evidence: str | None = None
 
     def evidence_requirement(self, *, evidence_after: datetime | None = None) -> str:
@@ -276,6 +279,15 @@ def _latest_event(events: Sequence[ManagerEvent], event_types: set[str]) -> Mana
     return max(matches, key=lambda event: event.created_at)
 
 
+def _codex_review_succeeded(event: ManagerEvent) -> bool:
+    if event.event_type != "codex-review":
+        return False
+    match = re.search(r"\breturncode=(\d+)\b", event.notes or "")
+    if match is None:
+        return True
+    return int(match.group(1)) == 0
+
+
 def _has_current_codex_review(worker: WorkerSession) -> bool:
     if worker.current_path is None:
         return False
@@ -284,7 +296,7 @@ def _has_current_codex_review(worker: WorkerSession) -> bool:
         worker_session=worker.target(),
         limit=20,
     )
-    latest_review = _latest_event(events, {"codex-review"})
+    latest_review = _latest_event([event for event in events if _codex_review_succeeded(event)], {"codex-review"})
     if latest_review is None:
         return False
     latest_dispatch = _latest_event(events, {"worker-start", "worker-steer", "worker-resume"})
@@ -293,7 +305,76 @@ def _has_current_codex_review(worker: WorkerSession) -> bool:
     return latest_review.created_at >= latest_dispatch.created_at
 
 
-def _worker_ready_for_codex_review(worker: WorkerSession) -> bool:
+def _git_line(repo: Path, args: Sequence[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.strip()
+    return text or None
+
+
+def _latest_commit(repo: Path) -> tuple[str, datetime, str] | None:
+    raw = _git_line(repo, ["log", "-1", "--format=%H%x00%ct%x00%s"])
+    if not raw:
+        return None
+    parts = raw.split("\x00", 2)
+    if len(parts) != 3:
+        return None
+    sha, timestamp_s, title = parts
+    try:
+        committed_at = datetime.fromtimestamp(int(timestamp_s), tz=timezone.utc)
+    except ValueError:
+        return None
+    return sha, committed_at, title
+
+
+def _codex_review_events(worker: WorkerSession) -> list[ManagerEvent]:
+    if worker.current_path is None:
+        return []
+    return matching_events(
+        repo=worker.current_path,
+        worker_session=worker.target(),
+        limit=20,
+    )
+
+
+def _latest_codex_review(worker: WorkerSession) -> ManagerEvent | None:
+    return _latest_event(
+        [event for event in _codex_review_events(worker) if _codex_review_succeeded(event)],
+        {"codex-review"},
+    )
+
+
+def _latest_worker_dispatch(worker: WorkerSession) -> ManagerEvent | None:
+    return _latest_event(_codex_review_events(worker), {"worker-start", "worker-steer", "worker-resume"})
+
+
+def _unreviewed_worker_commit(worker: WorkerSession) -> tuple[str, str] | None:
+    if worker.kind() != "codex" or worker.current_path is None:
+        return None
+    latest_commit = _latest_commit(worker.current_path)
+    if latest_commit is None:
+        return None
+    sha, committed_at, title = latest_commit
+    latest_dispatch = _latest_worker_dispatch(worker)
+    if latest_dispatch is not None and committed_at < latest_dispatch.created_at:
+        return None
+    latest_review = _latest_codex_review(worker)
+    if latest_review is not None and latest_review.created_at >= committed_at:
+        return None
+    return sha, title
+
+
+def _worker_ready_for_codex_review_marker(worker: WorkerSession) -> bool:
     if worker.kind() != "codex" or worker.current_path is None:
         return False
     if _has_current_codex_review(worker):
@@ -421,7 +502,31 @@ def recommend_next_action(
         worker = live_workers[0]
         target = worker.target()
         repo = str(worker.current_path) if worker.current_path else None
-        if _worker_ready_for_codex_review(worker):
+        unreviewed_commit = _unreviewed_worker_commit(worker)
+        if unreviewed_commit:
+            commit, title = unreviewed_commit
+            return NextAction(
+                kind="codex-review-worker",
+                repo=repo,
+                worker=target,
+                review_commit=commit,
+                review_title=title,
+                reason=f"{target} has unreviewed Codex commit {commit[:12]}",
+                command=(
+                    "venv/bin/python scripts/hermes-dev-codex-run-review.py "
+                    f"--repo {shlex.quote(str(worker.current_path))} "
+                    f"--session {shlex.quote(_session_name(worker.session_name))} "
+                    f"--commit {shlex.quote(commit)} "
+                    f"--title {shlex.quote(title)}"
+                    if worker.current_path
+                    else "venv/bin/python scripts/hermes-dev-codex-run-review.py"
+                ),
+                required_evidence=(
+                    f"Before claiming review completion, cite the Codex review "
+                    f"output artifact and codex-review manager event for commit `{commit}`."
+                ),
+            )
+        if _worker_ready_for_codex_review_marker(worker):
             return NextAction(
                 kind="codex-review-worker",
                 repo=repo,
@@ -749,6 +854,8 @@ def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecu
         generated_at=packet.generated_at,
         out_dir=report_dir,
         event_log=DEFAULT_EVENT_LOG,
+        commit=action.review_commit,
+        title=action.review_title,
     )
     return SafeExecutionResult(
         kind=action.kind,
@@ -769,6 +876,8 @@ def packet_to_json(packet: ManagerPacket) -> str:
             "task_id": packet.next_action.task_id,
             "repo": packet.next_action.repo,
             "worker": packet.next_action.worker,
+            "review_commit": packet.next_action.review_commit,
+            "review_title": packet.next_action.review_title,
             "manager_instruction": packet.next_action.manager_instruction(),
             "human_action": packet.next_action.human_action(),
             "evidence_after": packet.generated_at.isoformat(),

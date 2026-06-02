@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 from hermes_cli.dev_codex_run_review import (
     run_codex_review,
@@ -84,6 +85,7 @@ def test_run_codex_review_can_target_commit_with_title(tmp_path, monkeypatch):
 
     def fake_run_review_command(args, *, cwd, prompt, timeout):
         captured["args"] = args
+        captured["prompt"] = prompt
         return CommandResult(tuple(args), 0, "Verdict: READY_TO_MERGE\nConfidence: medium", "")
 
     monkeypatch.setattr("hermes_cli.dev_codex_run_review._run_review_command", fake_run_review_command)
@@ -98,4 +100,28 @@ def test_run_codex_review_can_target_commit_with_title(tmp_path, monkeypatch):
         title="demo commit",
     )
 
-    assert captured["args"] == ["codex", "review", "--commit", "abc123", "--title", "demo commit", "-"]
+    assert captured["args"] == ["codex", "review", "--commit", "abc123", "--title", "demo commit"]
+    assert captured["prompt"] is None
+
+
+def test_telegram_summary_relays_native_commit_review_line(tmp_path):
+    result = SimpleNamespace(
+        ok=True,
+        repo=tmp_path / "repo",
+        session="repo-codex",
+        command_result=CommandResult(
+            ("codex", "review"),
+            0,
+            "No actionable correctness issues were found.",
+            "",
+        ),
+        closeout=SimpleNamespace(
+            evidence_grade=SimpleNamespace(grade="weak"),
+            markdown_path=tmp_path / "closeout.md",
+        ),
+        output_path=tmp_path / "output.md",
+        prompt_path=tmp_path / "prompt.md",
+        event=SimpleNamespace(id="evt1"),
+    )
+
+    assert "review: No actionable correctness issues were found." in telegram_summary(result)

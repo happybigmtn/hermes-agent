@@ -114,7 +114,7 @@ def test_next_action_flags_blocked_codexworker_for_repair(isolated_kanban_home):
     assert "Evidence must be fresh" in markdown
 
 
-def test_next_action_supervises_active_worker_before_stale_board_packets(isolated_kanban_home):
+def test_next_action_supervises_active_worker_before_stale_board_packets(isolated_kanban_home, monkeypatch):
     now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
     kb.create_board("ludeme")
     conn = kb.connect(board="ludeme")
@@ -139,6 +139,8 @@ def test_next_action_supervises_active_worker_before_stale_board_packets(isolate
         dead=False,
         title="codex",
     )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action._latest_commit", lambda repo: None)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
 
     packet = collect_manager_packet(
         now=now,
@@ -161,6 +163,141 @@ def test_next_action_supervises_active_worker_before_stale_board_packets(isolate
     assert telegram_summary(packet, quiet_routine=True) == ""
 
 
+def test_next_action_runs_codex_review_for_unreviewed_worker_commit(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    commit = "abcdef1234567890"
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action._latest_commit",
+        lambda repo: (commit, datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc), "demo commit"),
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: [])
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "codex-review-worker"
+    assert packet.next_action.review_commit == commit
+    assert packet.next_action.review_title == "demo commit"
+    assert "unreviewed Codex commit abcdef123456" in packet.next_action.reason
+    assert f"--commit {commit}" in packet.next_action.command
+    assert "--title 'demo commit'" in packet.next_action.command
+
+
+def test_next_action_does_not_duplicate_reviewed_worker_commit(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action._latest_commit",
+        lambda repo: ("abcdef1234567890", datetime(2026, 6, 2, 1, 40, tzinfo=timezone.utc), "demo commit"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action.matching_events",
+        lambda **kwargs: [
+            ManagerEvent(
+                id="review",
+                created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+                event_type="codex-review",
+                repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="review",
+            notes="codex review returncode=0",
+        )
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "supervise-interactive-worker"
+
+
+def test_next_action_retries_failed_codex_review_event(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action._latest_commit",
+        lambda repo: ("abcdef1234567890", datetime(2026, 6, 2, 1, 40, tzinfo=timezone.utc), "demo commit"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action.matching_events",
+        lambda **kwargs: [
+            ManagerEvent(
+                id="review",
+                created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+                event_type="codex-review",
+                repo=str(repo),
+                worker_session="ludeme-codex",
+                intent="review",
+                notes="codex review returncode=2",
+            )
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "codex-review-worker"
+    assert packet.next_action.review_commit == "abcdef1234567890"
+
+
 def test_next_action_runs_codex_review_for_review_ready_worker(isolated_kanban_home, monkeypatch):
     now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
     repo = Path("/srv/dev/repos/ludeme")
@@ -175,6 +312,7 @@ def test_next_action_runs_codex_review_for_review_ready_worker(isolated_kanban_h
         dead=False,
         title="codex",
     )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action._latest_commit", lambda repo: None)
     monkeypatch.setattr(
         "hermes_cli.dev_manager_next_action.capture_worker_pane",
         lambda target: ["Implementation complete. Ready for review."],
@@ -216,6 +354,7 @@ def test_next_action_does_not_duplicate_current_codex_review(isolated_kanban_hom
         dead=False,
         title="codex",
     )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action._latest_commit", lambda repo: None)
     events = [
         ManagerEvent(
             id="start",
@@ -232,6 +371,7 @@ def test_next_action_does_not_duplicate_current_codex_review(isolated_kanban_hom
             repo=str(repo),
             worker_session="ludeme-codex",
             intent="review",
+            notes="codex review returncode=0",
         ),
     ]
     monkeypatch.setattr(
@@ -370,6 +510,8 @@ def test_execute_safe_action_delegates_codex_review(monkeypatch, tmp_path):
             command="review",
             repo=str(repo),
             worker="repo-codex:0.0",
+            review_commit="abcdef1234567890",
+            review_title="demo commit",
         ),
     )
     captured = {}
@@ -402,3 +544,5 @@ def test_execute_safe_action_delegates_codex_review(monkeypatch, tmp_path):
     assert captured["session"] == "repo-codex"
     assert captured["generated_at"] == now
     assert captured["out_dir"] == tmp_path / "reports"
+    assert captured["commit"] == "abcdef1234567890"
+    assert captured["title"] == "demo commit"

@@ -24,9 +24,11 @@ install -m 0755 scripts/hermes-dev-codex-run-review.py ~/.hermes/scripts/dev-cod
 
 ## Auto-Execute From Manager Tick
 
-The manager tick can execute this gate automatically for Codex workers that
-emit an explicit review-ready marker such as `ready for review`,
-`review-ready`, `please review`, `implementation complete`, or `handoff ready`.
+The manager tick can execute this gate automatically for live supervised Codex
+workers. The primary trigger is a new latest commit in the worker's repo that
+does not have a newer `codex-review` manager event. The fallback trigger is an
+explicit review-ready marker such as `ready for review`, `review-ready`,
+`please review`, `implementation complete`, or `handoff ready`.
 
 ```bash
 ~/.hermes/scripts/dev-manager-next-action.py
@@ -35,7 +37,8 @@ emit an explicit review-ready marker such as `ready for review`,
 The installed wrapper defaults to safe autopilot mode, equivalent to
 `--execute-safe --quiet-routine`. `--execute-safe` currently runs only this Codex
 review gate. Hermes still does not write the verdict; it relays Codex's review
-output.
+output. This is not a global "review every pushed commit" hook; it is scoped to
+the supervised Codex worker Hermes is currently managing.
 
 ## Review A Commit
 

@@ -167,10 +167,11 @@ truly outside Hermes authority.
 
 Hermes may execute a narrow safe follow-up without asking the human when the
 action preserves the role split and writes durable artifacts. The first allowed
-safe action is `codex-review-worker`: if a Codex worker pane contains an
-explicit review-ready marker and no newer `codex-review` event exists, Hermes
-may run the Codex review gate and relay Codex's verdict. Hermes must not
-generalize this into arbitrary shell execution without a new contract.
+safe action is `codex-review-worker`: if a supervised Codex worker has a latest
+commit without a newer `codex-review` event, or its pane contains an explicit
+review-ready marker and no newer `codex-review` event exists, Hermes may run
+the Codex review gate and relay Codex's verdict. Hermes must not generalize
+this into arbitrary shell execution without a new contract.
 
 ## Current Highest-Impact Improvements
 

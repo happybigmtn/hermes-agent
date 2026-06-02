@@ -73,7 +73,7 @@ def _run_review_command(
     args: Sequence[str],
     *,
     cwd: Path,
-    prompt: str,
+    prompt: str | None,
     timeout: int,
 ) -> CommandResult:
     if not shutil.which(args[0]):
@@ -102,6 +102,11 @@ def _review_target_args(*, base: str | None, commit: str | None, title: str | No
     if base:
         return ["--base", base]
     return ["--uncommitted"]
+
+
+def _review_accepts_prompt(*, commit: str | None) -> bool:
+    # Codex CLI rejects `codex review --commit <sha> [PROMPT]`.
+    return commit is None
 
 
 def build_review_prompt(
@@ -219,8 +224,16 @@ def run_codex_review(
     prompt_path = run_dir / "codex-review-prompt.md"
     output_path = run_dir / "codex-review-output.md"
     prompt_path.write_text(prompt, encoding="utf-8")
-    args = ["codex", "review", *_review_target_args(base=base, commit=commit, title=title), "-"]
-    command_result = _run_review_command(args, cwd=repo, prompt=prompt, timeout=timeout)
+    accepts_prompt = _review_accepts_prompt(commit=commit)
+    args = ["codex", "review", *_review_target_args(base=base, commit=commit, title=title)]
+    if accepts_prompt:
+        args.append("-")
+    command_result = _run_review_command(
+        args,
+        cwd=repo,
+        prompt=prompt if accepts_prompt else None,
+        timeout=timeout,
+    )
     write_review_output(output_path, result=command_result)
     event = record_event(
         repo=repo,
@@ -258,9 +271,18 @@ def _extract_prefixed_line(text: str, prefix: str) -> str | None:
     return None
 
 
+def _first_review_line(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return _one_line(stripped)
+    return None
+
+
 def telegram_summary(result: CodexReviewResult) -> str:
     verdict = _extract_prefixed_line(result.command_result.stdout, "Verdict:")
     confidence = _extract_prefixed_line(result.command_result.stdout, "Confidence:")
+    review_line = None if verdict else _first_review_line(result.command_result.stdout)
     lines = [
         "Codex review ready." if result.ok else "Codex review attention.",
         f"repo: {result.repo}",
@@ -270,6 +292,8 @@ def telegram_summary(result: CodexReviewResult) -> str:
         lines.append(verdict)
     if confidence:
         lines.append(confidence)
+    if review_line:
+        lines.append(f"review: {review_line}")
     lines.extend(
         [
             f"receipt grade: {result.closeout.evidence_grade.grade}",
