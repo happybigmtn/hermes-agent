@@ -170,10 +170,19 @@ action preserves the role split and writes durable artifacts. The first allowed
 safe action is `codex-review-worker`: if a supervised Codex worker has a latest
 commit without a newer `codex-review` event, or its pane contains an explicit
 review-ready marker and no newer `codex-review` event exists, Hermes may run
-the Codex review gate and relay Codex's verdict. The gate must pass the saved
-structured review prompt to Codex for both commit and uncommitted targets.
-Hermes must not generalize
-this into arbitrary shell execution without a new contract.
+the Codex review gate. The gate must pass the saved structured review prompt to
+Codex for both commit and uncommitted targets. Hermes dispatches the review in
+a detached tmux session, records `codex-review-start`, avoids duplicate
+dispatch while the review is pending, surfaces the completed `codex-review`
+event once, and records `codex-review-report`.
+
+Hermes must not run Codex as a foreground subprocess inside a gateway,
+Telegram, cron, or agent turn. Codex implementation, receipt, review, repair,
+and closeout work must run in a named tmux worker or detached tmux dispatch so
+Hermes can return quickly and supervise via panes, events, receipts, artifacts,
+and gbrain. Foreground shell remains acceptable only for short deterministic
+inspection commands that are not Codex workers. Hermes must not generalize this
+into arbitrary shell execution without a new contract.
 
 ## Current Highest-Impact Improvements
 

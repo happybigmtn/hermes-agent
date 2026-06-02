@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
-from types import SimpleNamespace
 
 import pytest
 
@@ -20,10 +19,9 @@ from hermes_cli.dev_manager_next_action import (
     telegram_summary,
     write_gbrain_page,
 )
-from hermes_cli.dev_manager_events import ManagerEvent
+from hermes_cli.dev_manager_events import ManagerEvent, load_events
 from hermes_cli.dev_orchestrator_preflight import Check, PreflightResult, ProfilePreflight
 from hermes_cli.dev_run_status import WorkerSession
-from hermes_cli.dev_supervision_closeout import CommandResult
 
 
 @pytest.fixture
@@ -298,6 +296,225 @@ def test_next_action_retries_failed_codex_review_event(isolated_kanban_home, mon
     assert packet.next_action.review_commit == "abcdef1234567890"
 
 
+def test_next_action_waits_for_pending_codex_review(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    commit = "abcdef1234567890"
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action._latest_commit",
+        lambda repo: (commit, datetime(2026, 6, 2, 1, 40, tzinfo=timezone.utc), "demo commit"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action.matching_events",
+        lambda **kwargs: [
+            ManagerEvent(
+                id="start",
+                created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+                event_type="codex-review-start",
+                repo=str(repo),
+                worker_session="ludeme-codex",
+                intent="start review",
+                notes=f"pid=42 commit={commit}",
+            )
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "wait-for-codex-review"
+    assert packet.next_action.review_event_id == "start"
+    assert "already has Codex review start in progress" in packet.next_action.reason
+    assert telegram_summary(packet, quiet_routine=True) == ""
+
+
+def test_next_action_retries_stale_pending_codex_review(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 4, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    commit = "abcdef1234567890"
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action._latest_commit",
+        lambda repo: (commit, datetime(2026, 6, 2, 1, 40, tzinfo=timezone.utc), "demo commit"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action.matching_events",
+        lambda **kwargs: [
+            ManagerEvent(
+                id="start",
+                created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+                event_type="codex-review-start",
+                repo=str(repo),
+                worker_session="ludeme-codex",
+                intent="start review",
+                notes=f"pid=42 commit={commit}",
+            )
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "codex-review-worker"
+    assert packet.next_action.review_commit == commit
+
+
+def test_next_action_reports_completed_async_codex_review_once(isolated_kanban_home, monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    output = tmp_path / "codex-review-output.md"
+    output.write_text(
+        "# Codex Run Review\n\n## Stdout\n\n```text\nVerdict: READY_TO_MERGE\nConfidence: high\n```\n",
+        encoding="utf-8",
+    )
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    events = [
+        ManagerEvent(
+            id="start",
+            created_at=datetime(2026, 6, 2, 1, 42, tzinfo=timezone.utc),
+            event_type="codex-review-start",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="start review",
+        ),
+        ManagerEvent(
+            id="review",
+            created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+            event_type="codex-review",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="review",
+            resulting_artifacts=[str(output)],
+            notes="codex review returncode=0",
+        ),
+    ]
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action._latest_commit", lambda repo: None)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: events)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "report-codex-review-result"
+    assert packet.next_action.review_event_id == "review"
+
+
+def test_next_action_does_not_repeat_reported_async_codex_review(isolated_kanban_home, monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    output = tmp_path / "codex-review-output.md"
+    output.write_text("Verdict: READY_TO_MERGE\n", encoding="utf-8")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    events = [
+        ManagerEvent(
+            id="start",
+            created_at=datetime(2026, 6, 2, 1, 42, tzinfo=timezone.utc),
+            event_type="codex-review-start",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="start review",
+        ),
+        ManagerEvent(
+            id="review",
+            created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+            event_type="codex-review",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="review",
+            resulting_artifacts=[str(output)],
+            notes="codex review returncode=0",
+        ),
+        ManagerEvent(
+            id="report",
+            created_at=datetime(2026, 6, 2, 1, 44, 30, tzinfo=timezone.utc),
+            event_type="codex-review-report",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="report",
+            notes="reported_event=review returncode=0",
+        ),
+    ]
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action._latest_commit", lambda repo: None)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: events)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.capture_worker_pane", lambda target: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "supervise-interactive-worker"
+
+
 def test_next_action_runs_codex_review_for_review_ready_worker(isolated_kanban_home, monkeypatch):
     now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
     repo = Path("/srv/dev/repos/ludeme")
@@ -337,7 +554,7 @@ def test_next_action_runs_codex_review_for_review_ready_worker(isolated_kanban_h
     assert "Codex review" in packet.next_action.evidence_requirement()
     summary = telegram_summary(packet)
     assert "Dev manager status: codex-review-worker" in summary
-    assert "relay Codex's merge/fix/blocked verdict" in summary
+    assert "let the next manager tick surface Codex's merge/fix/blocked verdict" in summary
 
 
 def test_next_action_does_not_duplicate_current_codex_review(isolated_kanban_home, monkeypatch):
@@ -494,10 +711,11 @@ def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
     assert "Dev Orchestrator Manager Tick" in seen["args"][4]
 
 
-def test_execute_safe_action_delegates_codex_review(monkeypatch, tmp_path):
+def test_execute_safe_action_dispatches_codex_review_async(monkeypatch, tmp_path):
     now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
     repo = tmp_path / "repo"
     repo.mkdir()
+    event_log = tmp_path / "events.jsonl"
     packet = ManagerPacket(
         generated_at=now,
         preflight=_preflight(now),
@@ -516,33 +734,87 @@ def test_execute_safe_action_delegates_codex_review(monkeypatch, tmp_path):
     )
     captured = {}
 
-    def fake_run_codex_review(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            ok=True,
-            repo=repo,
-            session="repo-codex",
-            command_result=CommandResult(("codex", "review"), 0, "Verdict: READY_TO_MERGE\nConfidence: high", ""),
-            closeout=SimpleNamespace(
-                evidence_grade=SimpleNamespace(grade="verified"),
-                markdown_path=tmp_path / "closeout.md",
-            ),
-            output_path=tmp_path / "output.md",
-            prompt_path=tmp_path / "prompt.md",
-            event=SimpleNamespace(id="evt1"),
-        )
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr("hermes_cli.dev_codex_run_review.run_codex_review", fake_run_codex_review)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.DEFAULT_EVENT_LOG", event_log)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.shutil.which", lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.subprocess.run", fake_run)
 
     result = execute_safe_action(packet, report_dir=tmp_path / "reports")
 
     assert result is not None
     assert result.ok is True
     assert result.kind == "codex-review-worker"
-    assert "Verdict: READY_TO_MERGE" in result.summary
-    assert captured["repo"] == repo
-    assert captured["session"] == "repo-codex"
-    assert captured["generated_at"] == now
-    assert captured["out_dir"] == tmp_path / "reports"
-    assert captured["commit"] == "abcdef1234567890"
-    assert captured["title"] == "demo commit"
+    assert result.notify is False
+    assert "Codex review started." in result.summary
+    assert captured["args"][:4] == ["tmux", "new-session", "-d", "-s"]
+    assert captured["args"][4].startswith("repo-codex-review-")
+    run_script = Path(captured["args"][5])
+    script_text = run_script.read_text(encoding="utf-8")
+    assert "scripts/hermes-dev-codex-run-review.py" in script_text
+    assert "--commit abcdef1234567890" in script_text
+    events = load_events([event_log])
+    assert len(events) == 1
+    assert events[0].event_type == "codex-review-start"
+    assert events[0].worker_session == "repo-codex"
+    assert "tmux=repo-codex-review-" in str(events[0].notes)
+    assert "commit=abcdef1234567890" in str(events[0].notes)
+    assert events[0].resulting_artifacts[0].endswith("codex-review-tmux.log")
+    assert events[0].resulting_artifacts[1].endswith("run-codex-review.sh")
+
+
+def test_execute_safe_action_reports_completed_codex_review(monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "codex-review-output.md"
+    output.write_text(
+        "# Codex Run Review\n\n## Stdout\n\n```text\nVerdict: FIX_FIRST\nConfidence: medium\n```\n",
+        encoding="utf-8",
+    )
+    event_log = tmp_path / "events.jsonl"
+    review = ManagerEvent(
+        id="review",
+        created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+        event_type="codex-review",
+        repo=str(repo),
+        worker_session="repo-codex",
+        intent="review",
+        resulting_artifacts=[str(output)],
+        notes="codex review returncode=0",
+    )
+    packet = ManagerPacket(
+        generated_at=now,
+        preflight=_preflight(now),
+        workers=[],
+        boards=[],
+        runs=[],
+        next_action=NextAction(
+            kind="report-codex-review-result",
+            reason="review finished",
+            command="report",
+            repo=str(repo),
+            worker="repo-codex:0.0",
+            review_event_id="review",
+        ),
+    )
+
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.DEFAULT_EVENT_LOG", event_log)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: [review])
+
+    result = execute_safe_action(packet, report_dir=tmp_path / "reports")
+
+    assert result is not None
+    assert result.ok is True
+    assert result.notify is True
+    assert "Verdict: FIX_FIRST" in result.summary
+    assert "Confidence: medium" in result.summary
+    assert "reported:" in result.summary
+    events = load_events([event_log])
+    assert len(events) == 1
+    assert events[0].event_type == "codex-review-report"
+    assert events[0].resulting_artifacts == [str(output)]
+    assert "reported_event=review" in str(events[0].notes)

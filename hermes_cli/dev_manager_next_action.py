@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ from hermes_cli.dev_manager_events import (
     DEFAULT_EVENT_LOG,
     ManagerEvent,
     matching_events,
+    record_event,
 )
 from hermes_cli.dev_run_status import (
     DEFAULT_RECENT_HOURS,
@@ -58,6 +60,7 @@ ROUTINE_TELEGRAM_KINDS = {
     "run-review",
     "dispatch-task",
     "wait-for-active-run",
+    "wait-for-codex-review",
     "execute-plan-slice",
     "create-campaign-plan",
 }
@@ -74,6 +77,7 @@ REVIEW_READY_MARKERS = (
     "ready to review",
 )
 REVIEW_CAPTURE_LINES = 80
+PENDING_REVIEW_STALE_MINUTES = float(os.getenv("HERMES_CODEX_REVIEW_PENDING_STALE_MINUTES", "120"))
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,7 @@ class NextAction:
     worker: str | None = None
     review_commit: str | None = None
     review_title: str | None = None
+    review_event_id: str | None = None
     required_evidence: str | None = None
 
     def evidence_requirement(self, *, evidence_after: datetime | None = None) -> str:
@@ -156,9 +161,20 @@ class NextAction:
     def manager_instruction(self) -> str:
         if self.kind == "codex-review-worker":
             return (
-                "Run the Codex review gate for this worker, save the prompt/output "
-                "artifacts, record the codex-review event, and relay Codex's "
-                "merge/fix/blocked verdict without rewriting it."
+                "Start the Codex review gate for this worker in a detached "
+                "tmux session, record a codex-review-start event, and let the "
+                "next manager tick surface Codex's merge/fix/blocked verdict."
+            )
+        if self.kind == "wait-for-codex-review":
+            return (
+                "Keep monitoring; a Codex review is already running for this "
+                "worker, so do not dispatch a duplicate review."
+            )
+        if self.kind == "report-codex-review-result":
+            return (
+                "Relay the completed Codex review result, record that it was "
+                "reported, and only ask the human if Codex returned a blocker "
+                "or fix-first decision."
             )
         if self.worker:
             return (
@@ -225,6 +241,7 @@ class SafeExecutionResult:
     ok: bool
     summary: str
     returncode: int = 0
+    notify: bool = True
 
 
 def _live_supervised_workers(workers: Sequence[WorkerSession]) -> list[WorkerSession]:
@@ -288,6 +305,18 @@ def _codex_review_succeeded(event: ManagerEvent) -> bool:
     return int(match.group(1)) == 0
 
 
+def _review_returncode(event: ManagerEvent) -> int:
+    match = re.search(r"\breturncode=(\d+)\b", event.notes or "")
+    if match is None:
+        return 0
+    return int(match.group(1))
+
+
+def _event_note_value(event: ManagerEvent, key: str) -> str | None:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", event.notes or "")
+    return match.group(1) if match else None
+
+
 def _has_current_codex_review(worker: WorkerSession) -> bool:
     if worker.current_path is None:
         return False
@@ -303,6 +332,48 @@ def _has_current_codex_review(worker: WorkerSession) -> bool:
     if latest_dispatch is None:
         return True
     return latest_review.created_at >= latest_dispatch.created_at
+
+
+def _latest_codex_review_start(worker: WorkerSession) -> ManagerEvent | None:
+    return _latest_event(_codex_review_events(worker), {"codex-review-start"})
+
+
+def _pending_codex_review(worker: WorkerSession, *, now: datetime, since: datetime | None = None) -> ManagerEvent | None:
+    latest_start = _latest_codex_review_start(worker)
+    if latest_start is None:
+        return None
+    if since is not None and latest_start.created_at < since:
+        return None
+    if now - latest_start.created_at > timedelta(minutes=PENDING_REVIEW_STALE_MINUTES):
+        return None
+    latest_finish = _latest_event(_codex_review_events(worker), {"codex-review"})
+    if latest_finish is not None and latest_finish.created_at >= latest_start.created_at:
+        return None
+    return latest_start
+
+
+def _unreported_codex_review(worker: WorkerSession) -> ManagerEvent | None:
+    latest_start = _latest_codex_review_start(worker)
+    if latest_start is None:
+        return None
+    events = _codex_review_events(worker)
+    finished = [
+        event
+        for event in events
+        if event.event_type == "codex-review" and event.created_at >= latest_start.created_at
+    ]
+    latest_finish = _latest_event(finished, {"codex-review"})
+    if latest_finish is None:
+        return None
+    reported = [
+        event
+        for event in events
+        if event.event_type == "codex-review-report"
+        and _event_note_value(event, "reported_event") == latest_finish.id
+    ]
+    if reported:
+        return None
+    return latest_finish
 
 
 def _git_line(repo: Path, args: Sequence[str]) -> str | None:
@@ -358,7 +429,7 @@ def _latest_worker_dispatch(worker: WorkerSession) -> ManagerEvent | None:
     return _latest_event(_codex_review_events(worker), {"worker-start", "worker-steer", "worker-resume"})
 
 
-def _unreviewed_worker_commit(worker: WorkerSession) -> tuple[str, str] | None:
+def _unreviewed_worker_commit(worker: WorkerSession, *, now: datetime) -> tuple[str, str] | None:
     if worker.kind() != "codex" or worker.current_path is None:
         return None
     latest_commit = _latest_commit(worker.current_path)
@@ -371,13 +442,19 @@ def _unreviewed_worker_commit(worker: WorkerSession) -> tuple[str, str] | None:
     latest_review = _latest_codex_review(worker)
     if latest_review is not None and latest_review.created_at >= committed_at:
         return None
+    if _pending_codex_review(worker, now=now, since=committed_at) is not None:
+        return None
     return sha, title
 
 
-def _worker_ready_for_codex_review_marker(worker: WorkerSession) -> bool:
+def _worker_ready_for_codex_review_marker(worker: WorkerSession, *, now: datetime) -> bool:
     if worker.kind() != "codex" or worker.current_path is None:
         return False
     if _has_current_codex_review(worker):
+        return False
+    latest_dispatch = _latest_worker_dispatch(worker)
+    since = latest_dispatch.created_at if latest_dispatch else None
+    if _pending_codex_review(worker, now=now, since=since) is not None:
         return False
     return _has_review_ready_marker(capture_worker_pane(worker.target()))
 
@@ -502,7 +579,32 @@ def recommend_next_action(
         worker = live_workers[0]
         target = worker.target()
         repo = str(worker.current_path) if worker.current_path else None
-        unreviewed_commit = _unreviewed_worker_commit(worker)
+        now = preflight.generated_at
+        unreported_review = _unreported_codex_review(worker)
+        if unreported_review:
+            return NextAction(
+                kind="report-codex-review-result",
+                repo=repo,
+                worker=target,
+                review_event_id=unreported_review.id,
+                reason=f"{target} has completed Codex review {unreported_review.id} that has not been reported",
+                command="venv/bin/python scripts/hermes-dev-manager-next-action.py --execute-safe --quiet-routine",
+                required_evidence=(
+                    f"Before claiming review result delivery, cite codex-review "
+                    f"event `{unreported_review.id}` and its output artifact."
+                ),
+            )
+        pending_review = _pending_codex_review(worker, now=now)
+        if pending_review:
+            return NextAction(
+                kind="wait-for-codex-review",
+                repo=repo,
+                worker=target,
+                review_event_id=pending_review.id,
+                reason=f"{target} already has Codex review {pending_review.id} in progress",
+                command="venv/bin/python scripts/hermes-dev-manager-events.py list",
+            )
+        unreviewed_commit = _unreviewed_worker_commit(worker, now=now)
         if unreviewed_commit:
             commit, title = unreviewed_commit
             return NextAction(
@@ -526,7 +628,7 @@ def recommend_next_action(
                     f"output artifact and codex-review manager event for commit `{commit}`."
                 ),
             )
-        if _worker_ready_for_codex_review_marker(worker):
+        if _worker_ready_for_codex_review_marker(worker, now=now):
             return NextAction(
                 kind="codex-review-worker",
                 repo=repo,
@@ -839,30 +941,235 @@ def telegram_summary(packet: ManagerPacket, *, quiet_routine: bool = False) -> s
     return "\n".join(lines)
 
 
-def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecutionResult | None:
-    action = packet.next_action
-    if action.kind != "codex-review-worker" or not action.repo or not action.worker:
-        return None
-    from hermes_cli.dev_codex_run_review import (
-        run_codex_review,
-        telegram_summary as codex_review_summary,
-    )
+def _slugify(value: str) -> str:
+    chars: list[str] = []
+    for char in value.lower():
+        if char.isalnum():
+            chars.append(char)
+        elif chars and chars[-1] != "-":
+            chars.append("-")
+    return "".join(chars).strip("-") or "review"
 
-    result = run_codex_review(
-        repo=Path(action.repo),
-        session=_session_name(action.worker),
-        generated_at=packet.generated_at,
-        out_dir=report_dir,
+
+def _review_script_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "scripts" / "hermes-dev-codex-run-review.py"
+
+
+def _review_command_args(action: NextAction, *, report_dir: Path) -> list[str]:
+    args = [
+        sys.executable,
+        str(_review_script_path()),
+        "--repo",
+        str(action.repo),
+        "--session",
+        _session_name(str(action.worker)),
+        "--out-dir",
+        str(report_dir),
+        "--event-log",
+        str(DEFAULT_EVENT_LOG),
+    ]
+    if action.review_commit:
+        args.extend(["--commit", action.review_commit])
+    if action.review_title:
+        args.extend(["--title", action.review_title])
+    return args
+
+
+def _dispatch_codex_review(packet: ManagerPacket, *, report_dir: Path) -> SafeExecutionResult:
+    action = packet.next_action
+    assert action.repo is not None and action.worker is not None
+    if not shutil.which("tmux"):
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary="Codex review dispatch failed: tmux is required; refusing to run Codex in-process.",
+            returncode=127,
+        )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = packet.generated_at.strftime("%Y%m%d-%H%M%S")
+    run_dir = report_dir / f"codex-review-dispatch-{_slugify(Path(action.repo).name)}-{_slugify(action.worker)}-{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    launch_log = run_dir / "codex-review-tmux.log"
+    run_script = run_dir / "run-codex-review.sh"
+    tmux_session = f"{_slugify(Path(action.repo).name)}-codex-review-{packet.generated_at.strftime('%Y%m%d%H%M%S')}"
+    args = _review_command_args(action, report_dir=report_dir)
+    try:
+        run_script.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env bash",
+                    "set -o pipefail",
+                    "set +e",
+                    f"cd {shlex.quote(str(_review_script_path().parents[1]))}",
+                    f"{shlex.join(args)} > {shlex.quote(str(launch_log))} 2>&1",
+                    "status=$?",
+                    (
+                        "printf '\\n[hermes] codex review exited with %s at %s\\n' "
+                        f'"$status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> {shlex.quote(str(launch_log))}'
+                    ),
+                    'exit "$status"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        run_script.chmod(0o755)
+        dispatch = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", tmux_session, str(run_script)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"Codex review dispatch failed: {exc}",
+            returncode=127,
+        )
+    if dispatch.returncode != 0:
+        detail = (dispatch.stderr or dispatch.stdout or "").strip()
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"Codex review tmux dispatch failed: {detail or 'unknown tmux error'}",
+            returncode=dispatch.returncode,
+        )
+    event = record_event(
+        repo=action.repo,
+        worker_session=_session_name(action.worker),
+        intent=f"Start async Codex review for `{action.worker}`",
         event_log=DEFAULT_EVENT_LOG,
-        commit=action.review_commit,
-        title=action.review_title,
+        event_type="codex-review-start",
+        requested_by="hermes",
+        delivery_channel="telegram",
+        resulting_artifacts=[str(launch_log), str(run_script)],
+        notes=" ".join(
+            item
+            for item in (
+                f"tmux={tmux_session}",
+                f"commit={action.review_commit}" if action.review_commit else "",
+            )
+            if item
+        ),
+        created_at=packet.generated_at,
     )
     return SafeExecutionResult(
         kind=action.kind,
-        ok=result.ok,
-        summary=codex_review_summary(result),
-        returncode=result.command_result.returncode,
+        ok=True,
+        summary=(
+            "Codex review started.\n"
+            f"repo: {action.repo}\n"
+            f"session: {_session_name(action.worker)}\n"
+            f"tmux: {tmux_session}\n"
+            f"launch: {launch_log}\n"
+            f"event: {event.id}"
+        ),
+        notify=False,
     )
+
+
+def _review_output_path(event: ManagerEvent) -> Path | None:
+    for artifact in event.resulting_artifacts:
+        if artifact.endswith("codex-review-output.md"):
+            return Path(artifact)
+    return None
+
+
+def _extract_prefixed_line(text: str, prefix: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith(prefix.lower()):
+            return stripped
+    return None
+
+
+def _first_review_line(text: str) -> str | None:
+    ignored_prefixes = ("#", "command:", "return code:", "```", "- empty")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith(ignored_prefixes):
+            continue
+        return stripped
+    return None
+
+
+def _review_event_summary(event: ManagerEvent) -> str:
+    output_path = _review_output_path(event)
+    text = ""
+    if output_path and output_path.exists():
+        text = output_path.read_text(encoding="utf-8", errors="replace")
+    verdict = _extract_prefixed_line(text, "Verdict:")
+    confidence = _extract_prefixed_line(text, "Confidence:")
+    review_line = None if verdict else _first_review_line(text)
+    ok = _review_returncode(event) == 0
+    lines = [
+        "Codex review ready." if ok else "Codex review attention.",
+        f"repo: {event.repo}",
+        f"session: {event.worker_session}",
+    ]
+    if verdict:
+        lines.append(verdict)
+    if confidence:
+        lines.append(confidence)
+    if review_line:
+        lines.append(f"review: {review_line}")
+    if output_path:
+        lines.append(f"output: {output_path}")
+    lines.append(f"event: {event.id}")
+    if not ok:
+        lines.append(f"attention: codex review command returned {_review_returncode(event)}")
+    return "\n".join(lines)
+
+
+def _report_codex_review_result(packet: ManagerPacket) -> SafeExecutionResult:
+    action = packet.next_action
+    if not action.repo or not action.worker or not action.review_event_id:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary="Codex review report failed: missing repo, worker, or review event id",
+            returncode=1,
+        )
+    events = matching_events(repo=action.repo, worker_session=action.worker, limit=50)
+    review = next((event for event in events if event.id == action.review_event_id), None)
+    if review is None:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"Codex review report failed: event {action.review_event_id} not found",
+            returncode=1,
+        )
+    report_event = record_event(
+        repo=action.repo,
+        worker_session=_session_name(action.worker),
+        intent=f"Report Codex review result `{review.id}`",
+        event_log=DEFAULT_EVENT_LOG,
+        event_type="codex-review-report",
+        requested_by="hermes",
+        delivery_channel="telegram",
+        resulting_artifacts=review.resulting_artifacts,
+        notes=f"reported_event={review.id} returncode={_review_returncode(review)}",
+        created_at=packet.generated_at,
+    )
+    return SafeExecutionResult(
+        kind=action.kind,
+        ok=_review_returncode(review) == 0,
+        summary=_review_event_summary(review) + f"\nreported: {report_event.id}",
+        returncode=_review_returncode(review),
+    )
+
+
+def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecutionResult | None:
+    action = packet.next_action
+    if action.kind == "report-codex-review-result":
+        return _report_codex_review_result(packet)
+    if action.kind != "codex-review-worker" or not action.repo or not action.worker:
+        return None
+    return _dispatch_codex_review(packet, report_dir=report_dir)
 
 
 def packet_to_json(packet: ManagerPacket) -> str:
@@ -878,6 +1185,7 @@ def packet_to_json(packet: ManagerPacket) -> str:
             "worker": packet.next_action.worker,
             "review_commit": packet.next_action.review_commit,
             "review_title": packet.next_action.review_title,
+            "review_event_id": packet.next_action.review_event_id,
             "manager_instruction": packet.next_action.manager_instruction(),
             "human_action": packet.next_action.human_action(),
             "evidence_after": packet.generated_at.isoformat(),
@@ -989,9 +1297,9 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
-    elif execution_result:
+    elif execution_result and execution_result.notify:
         print(execution_result.summary)
-    else:
+    elif not execution_result:
         summary = telegram_summary(packet, quiet_routine=args.quiet_routine)
         if summary:
             print(summary)
