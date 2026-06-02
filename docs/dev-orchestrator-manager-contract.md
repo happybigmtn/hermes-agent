@@ -165,10 +165,12 @@ truly outside Hermes authority.
 
 ## Current Highest-Impact Improvements
 
-1. Add an agentic manager tick that can execute safe inspect/closeout/steer
+1. Auto-trigger Codex run review after supervised workers reach a completion
+   marker, quiet terminal state, or review handoff.
+2. Add an agentic manager tick that can execute safe inspect/closeout/steer
    actions itself, using the deterministic tick as input.
-2. Maintain a campaign registry across gbrain, tmux, Kanban, and `.auto`
+3. Maintain a campaign registry across gbrain, tmux, Kanban, and `.auto`
    artifacts so Hermes can juggle several repos without relying on memory of a
    prior chat.
-3. Turn every failed campaign into one process improvement: a doc, skill,
+4. Turn every failed campaign into one process improvement: a doc, skill,
    autodev check, Hermes manager behavior, or machine setup fix.
