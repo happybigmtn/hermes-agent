@@ -4,6 +4,11 @@
 Install into ~/.hermes/scripts/ and schedule with:
 
 hermes cron create "every 30m" --name dev-manager-next-action --script dev-manager-next-action.py --no-agent --deliver telegram
+
+With no CLI args this wrapper runs the safe autopilot path:
+
+- execute the Codex review gate when a Codex worker explicitly asks for review
+- suppress routine status packets Hermes can handle itself
 """
 
 from pathlib import Path
@@ -24,4 +29,7 @@ for candidate in (
 from hermes_cli.dev_manager_next_action import main
 
 
-raise SystemExit(main())
+DEFAULT_ARGS = ["--execute-safe", "--quiet-routine"]
+
+
+raise SystemExit(main(sys.argv[1:] or DEFAULT_ARGS))

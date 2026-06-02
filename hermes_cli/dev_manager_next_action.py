@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from collections import Counter
@@ -25,6 +26,11 @@ from hermes_cli.dev_orchestrator_preflight import (
     DEFAULT_ROLES,
     PreflightResult,
     collect_preflight,
+)
+from hermes_cli.dev_manager_events import (
+    DEFAULT_EVENT_LOG,
+    ManagerEvent,
+    matching_events,
 )
 from hermes_cli.dev_run_status import (
     DEFAULT_RECENT_HOURS,
@@ -44,6 +50,7 @@ DEFAULT_GBRAIN_SLUG = "dev-orchestrator-manager-next-action"
 ACTIONABLE_STATUSES = {"running", "blocked", "review", "ready", "todo", "triage"}
 ROUTINE_TELEGRAM_KINDS = {
     "supervise-interactive-worker",
+    "codex-review-worker",
     "repair-blocked-task",
     "inspect-stale-task",
     "inspect-run-attention",
@@ -53,6 +60,19 @@ ROUTINE_TELEGRAM_KINDS = {
     "execute-plan-slice",
     "create-campaign-plan",
 }
+REVIEW_READY_MARKERS = (
+    "ready for review",
+    "review-ready",
+    "review required",
+    "review requested",
+    "please review",
+    "implementation complete",
+    "implementation completed",
+    "closeout complete",
+    "handoff ready",
+    "ready to review",
+)
+REVIEW_CAPTURE_LINES = 80
 
 
 @dataclass(frozen=True)
@@ -131,6 +151,12 @@ class NextAction:
         )
 
     def manager_instruction(self) -> str:
+        if self.kind == "codex-review-worker":
+            return (
+                "Run the Codex review gate for this worker, save the prompt/output "
+                "artifacts, record the codex-review event, and relay Codex's "
+                "merge/fix/blocked verdict without rewriting it."
+            )
         if self.worker:
             return (
                 "Inspect the worker pane, repo status, and recent artifacts. If "
@@ -190,6 +216,14 @@ class ManagerPacket:
         return sum(1 for worker in self.workers if not worker.dead)
 
 
+@dataclass(frozen=True)
+class SafeExecutionResult:
+    kind: str
+    ok: bool
+    summary: str
+    returncode: int = 0
+
+
 def _live_supervised_workers(workers: Sequence[WorkerSession]) -> list[WorkerSession]:
     supervised = [
         worker
@@ -206,6 +240,65 @@ def _live_supervised_workers(workers: Sequence[WorkerSession]) -> list[WorkerSes
         )
     )
     return supervised
+
+
+def _session_name(session: str) -> str:
+    return session.split(":", 1)[0]
+
+
+def capture_worker_pane(target: str, *, lines: int = REVIEW_CAPTURE_LINES) -> list[str]:
+    if not shutil.which("tmux"):
+        return []
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-S", f"-{lines}", "-t", target],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0 or not result.stdout:
+        return []
+    return result.stdout.splitlines()
+
+
+def _has_review_ready_marker(lines: Sequence[str]) -> bool:
+    haystack = "\n".join(lines).lower()
+    return any(marker in haystack for marker in REVIEW_READY_MARKERS)
+
+
+def _latest_event(events: Sequence[ManagerEvent], event_types: set[str]) -> ManagerEvent | None:
+    matches = [event for event in events if event.event_type in event_types]
+    if not matches:
+        return None
+    return max(matches, key=lambda event: event.created_at)
+
+
+def _has_current_codex_review(worker: WorkerSession) -> bool:
+    if worker.current_path is None:
+        return False
+    events = matching_events(
+        repo=worker.current_path,
+        worker_session=worker.target(),
+        limit=20,
+    )
+    latest_review = _latest_event(events, {"codex-review"})
+    if latest_review is None:
+        return False
+    latest_dispatch = _latest_event(events, {"worker-start", "worker-steer", "worker-resume"})
+    if latest_dispatch is None:
+        return True
+    return latest_review.created_at >= latest_dispatch.created_at
+
+
+def _worker_ready_for_codex_review(worker: WorkerSession) -> bool:
+    if worker.kind() != "codex" or worker.current_path is None:
+        return False
+    if _has_current_codex_review(worker):
+        return False
+    return _has_review_ready_marker(capture_worker_pane(worker.target()))
 
 
 def _unix_age(now: datetime, unix_time: int | None) -> timedelta | None:
@@ -328,6 +421,24 @@ def recommend_next_action(
         worker = live_workers[0]
         target = worker.target()
         repo = str(worker.current_path) if worker.current_path else None
+        if _worker_ready_for_codex_review(worker):
+            return NextAction(
+                kind="codex-review-worker",
+                repo=repo,
+                worker=target,
+                reason=f"{target} has an explicit review-ready marker and no newer Codex review event",
+                command=(
+                    "venv/bin/python scripts/hermes-dev-codex-run-review.py "
+                    f"--repo {shlex.quote(str(worker.current_path))} "
+                    f"--session {shlex.quote(_session_name(worker.session_name))}"
+                    if worker.current_path
+                    else "venv/bin/python scripts/hermes-dev-codex-run-review.py"
+                ),
+                required_evidence=(
+                    f"Before claiming review completion, cite the Codex review "
+                    f"output artifact and codex-review manager event for `{target}`."
+                ),
+            )
         return NextAction(
             kind="supervise-interactive-worker",
             repo=repo,
@@ -623,6 +734,30 @@ def telegram_summary(packet: ManagerPacket, *, quiet_routine: bool = False) -> s
     return "\n".join(lines)
 
 
+def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecutionResult | None:
+    action = packet.next_action
+    if action.kind != "codex-review-worker" or not action.repo or not action.worker:
+        return None
+    from hermes_cli.dev_codex_run_review import (
+        run_codex_review,
+        telegram_summary as codex_review_summary,
+    )
+
+    result = run_codex_review(
+        repo=Path(action.repo),
+        session=_session_name(action.worker),
+        generated_at=packet.generated_at,
+        out_dir=report_dir,
+        event_log=DEFAULT_EVENT_LOG,
+    )
+    return SafeExecutionResult(
+        kind=action.kind,
+        ok=result.ok,
+        summary=codex_review_summary(result),
+        returncode=result.command_result.returncode,
+    )
+
+
 def packet_to_json(packet: ManagerPacket) -> str:
     data = {
         "generated_at": packet.generated_at.isoformat(),
@@ -694,6 +829,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=os.getenv("HERMES_DEV_MANAGER_QUIET_ROUTINE", "").lower() in {"1", "true", "yes", "on"},
         help="Print nothing for routine self-managed status packets",
     )
+    parser.add_argument(
+        "--execute-safe",
+        action="store_true",
+        default=os.getenv("HERMES_DEV_MANAGER_EXECUTE_SAFE", "").lower() in {"1", "true", "yes", "on"},
+        help="Execute safe deterministic follow-up actions, currently Codex run review",
+    )
     parser.add_argument("--profile", action="append", default=None, help="Preflight profile to check; repeatable")
     return parser
 
@@ -722,12 +863,31 @@ def main(argv: list[str] | None = None) -> int:
         write_gbrain=not args.no_gbrain,
         gbrain_slug=args.gbrain_slug,
     )
+    execution_result = execute_safe_action(packet, report_dir=Path(args.out_dir).expanduser()) if args.execute_safe else None
     if args.json:
         print(packet_to_json(packet))
+        if execution_result:
+            print(
+                json.dumps(
+                    {
+                        "safe_execution": {
+                            "kind": execution_result.kind,
+                            "ok": execution_result.ok,
+                            "returncode": execution_result.returncode,
+                        }
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+    elif execution_result:
+        print(execution_result.summary)
     else:
         summary = telegram_summary(packet, quiet_routine=args.quiet_routine)
         if summary:
             print(summary)
+    if execution_result and not execution_result.ok:
+        return execution_result.returncode or 1
     return 0
 
 

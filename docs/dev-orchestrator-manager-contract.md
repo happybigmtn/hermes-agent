@@ -163,14 +163,21 @@ should either be silent or say that no human action is required. Ask at most one
 decision question, with the recommended answer first, only when the blocker is
 truly outside Hermes authority.
 
+## Safe Auto-Execution
+
+Hermes may execute a narrow safe follow-up without asking the human when the
+action preserves the role split and writes durable artifacts. The first allowed
+safe action is `codex-review-worker`: if a Codex worker pane contains an
+explicit review-ready marker and no newer `codex-review` event exists, Hermes
+may run the Codex review gate and relay Codex's verdict. Hermes must not
+generalize this into arbitrary shell execution without a new contract.
+
 ## Current Highest-Impact Improvements
 
-1. Auto-trigger Codex run review after supervised workers reach a completion
-   marker, quiet terminal state, or review handoff.
-2. Add an agentic manager tick that can execute safe inspect/closeout/steer
+1. Add an agentic manager tick that can execute safe inspect/closeout/steer
    actions itself, using the deterministic tick as input.
-3. Maintain a campaign registry across gbrain, tmux, Kanban, and `.auto`
+2. Maintain a campaign registry across gbrain, tmux, Kanban, and `.auto`
    artifacts so Hermes can juggle several repos without relying on memory of a
    prior chat.
-4. Turn every failed campaign into one process improvement: a doc, skill,
+3. Turn every failed campaign into one process improvement: a doc, skill,
    autodev check, Hermes manager behavior, or machine setup fix.

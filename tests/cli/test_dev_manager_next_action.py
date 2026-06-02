@@ -3,21 +3,27 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.dev_manager_next_action import (
+    ManagerPacket,
+    NextAction,
     collect_board_snapshots,
     collect_manager_packet,
+    execute_safe_action,
     recommend_next_action,
     render_markdown,
     telegram_cadence,
     telegram_summary,
     write_gbrain_page,
 )
+from hermes_cli.dev_manager_events import ManagerEvent
 from hermes_cli.dev_orchestrator_preflight import Check, PreflightResult, ProfilePreflight
 from hermes_cli.dev_run_status import WorkerSession
+from hermes_cli.dev_supervision_closeout import CommandResult
 
 
 @pytest.fixture
@@ -155,6 +161,98 @@ def test_next_action_supervises_active_worker_before_stale_board_packets(isolate
     assert telegram_summary(packet, quiet_routine=True) == ""
 
 
+def test_next_action_runs_codex_review_for_review_ready_worker(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action.capture_worker_pane",
+        lambda target: ["Implementation complete. Ready for review."],
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: [])
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "codex-review-worker"
+    assert packet.next_action.worker == "ludeme-codex:0.0"
+    assert "scripts/hermes-dev-codex-run-review.py" in packet.next_action.command
+    assert "--repo /srv/dev/repos/ludeme" in packet.next_action.command
+    assert "--session ludeme-codex" in packet.next_action.command
+    assert "Codex review" in packet.next_action.evidence_requirement()
+    summary = telegram_summary(packet)
+    assert "Dev manager status: codex-review-worker" in summary
+    assert "relay Codex's merge/fix/blocked verdict" in summary
+
+
+def test_next_action_does_not_duplicate_current_codex_review(isolated_kanban_home, monkeypatch):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = Path("/srv/dev/repos/ludeme")
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=repo,
+        active=True,
+        dead=False,
+        title="codex",
+    )
+    events = [
+        ManagerEvent(
+            id="start",
+            created_at=datetime(2026, 6, 2, 1, 40, tzinfo=timezone.utc),
+            event_type="worker-start",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="start",
+        ),
+        ManagerEvent(
+            id="review",
+            created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+            event_type="codex-review",
+            repo=str(repo),
+            worker_session="ludeme-codex",
+            intent="review",
+        ),
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.dev_manager_next_action.capture_worker_pane",
+        lambda target: ["Implementation complete. Ready for review."],
+    )
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: events)
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "supervise-interactive-worker"
+
+
 def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home):
     now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
     kb.create_board("autonomy-bitino")
@@ -254,3 +352,53 @@ def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
     assert seen["kwargs"]["cwd"] == "/tmp"
     assert "input" not in seen["kwargs"]
     assert "Dev Orchestrator Manager Tick" in seen["args"][4]
+
+
+def test_execute_safe_action_delegates_codex_review(monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    packet = ManagerPacket(
+        generated_at=now,
+        preflight=_preflight(now),
+        workers=[],
+        boards=[],
+        runs=[],
+        next_action=NextAction(
+            kind="codex-review-worker",
+            reason="ready",
+            command="review",
+            repo=str(repo),
+            worker="repo-codex:0.0",
+        ),
+    )
+    captured = {}
+
+    def fake_run_codex_review(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            ok=True,
+            repo=repo,
+            session="repo-codex",
+            command_result=CommandResult(("codex", "review"), 0, "Verdict: READY_TO_MERGE\nConfidence: high", ""),
+            closeout=SimpleNamespace(
+                evidence_grade=SimpleNamespace(grade="verified"),
+                markdown_path=tmp_path / "closeout.md",
+            ),
+            output_path=tmp_path / "output.md",
+            prompt_path=tmp_path / "prompt.md",
+            event=SimpleNamespace(id="evt1"),
+        )
+
+    monkeypatch.setattr("hermes_cli.dev_codex_run_review.run_codex_review", fake_run_codex_review)
+
+    result = execute_safe_action(packet, report_dir=tmp_path / "reports")
+
+    assert result is not None
+    assert result.ok is True
+    assert result.kind == "codex-review-worker"
+    assert "Verdict: READY_TO_MERGE" in result.summary
+    assert captured["repo"] == repo
+    assert captured["session"] == "repo-codex"
+    assert captured["generated_at"] == now
+    assert captured["out_dir"] == tmp_path / "reports"

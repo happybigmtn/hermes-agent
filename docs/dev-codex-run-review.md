@@ -22,6 +22,21 @@ install -m 0755 scripts/hermes-dev-codex-run-review.py ~/.hermes/scripts/dev-cod
   --session ludeme-codex
 ```
 
+## Auto-Execute From Manager Tick
+
+The manager tick can execute this gate automatically for Codex workers that
+emit an explicit review-ready marker such as `ready for review`,
+`review-ready`, `please review`, `implementation complete`, or `handoff ready`.
+
+```bash
+~/.hermes/scripts/dev-manager-next-action.py
+```
+
+The installed wrapper defaults to safe autopilot mode, equivalent to
+`--execute-safe --quiet-routine`. `--execute-safe` currently runs only this Codex
+review gate. Hermes still does not write the verdict; it relays Codex's review
+output.
+
 ## Review A Commit
 
 ```bash
