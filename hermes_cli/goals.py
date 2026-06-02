@@ -102,8 +102,18 @@ DEV_MANAGER_GOAL_PREFLIGHT_TEMPLATE = (
     "This session is running under a development-manager profile. Before "
     "taking a broad or open-ended step, read this authoritative state packet. "
     "Follow `next_action` unless you have a concrete, state-based reason to "
-    "diverge; if you diverge, state the reason explicitly.\n"
+    "diverge; if you diverge, state the reason explicitly. Before claiming "
+    "progress or completion, cite durable evidence matching "
+    "`next_action.required_evidence`.\n"
     "{packet}\n\n"
+)
+
+DEV_MANAGER_RECEIPT_SUBGOAL = (
+    "Dev-manager progress requires durable evidence for the current "
+    "`next_action`: a Kanban comment/status/run summary, .auto receipt or "
+    "artifact path, gbrain page, git commit/PR, or focused test/check output. "
+    "If the response only says work was attempted, planned, or inspected "
+    "without citing durable evidence, this criterion is NOT satisfied."
 )
 
 
@@ -365,6 +375,12 @@ def _dev_manager_next_action_context() -> Optional[str]:
     except Exception as exc:
         logger.debug("dev manager goal preflight unavailable: %s", exc)
         return None
+
+
+def _dev_manager_receipt_subgoal() -> Optional[str]:
+    if not _dev_manager_goal_preflight_enabled():
+        return None
+    return DEV_MANAGER_RECEIPT_SUBGOAL
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -727,8 +743,13 @@ class GoalManager:
         state.turns_used += 1
         state.last_turn_at = time.time()
 
+        judge_subgoals = list(state.subgoals or [])
+        receipt_subgoal = _dev_manager_receipt_subgoal()
+        if receipt_subgoal:
+            judge_subgoals.append(receipt_subgoal)
+
         verdict, reason, parse_failed = judge_goal(
-            state.goal, last_response, subgoals=state.subgoals or None
+            state.goal, last_response, subgoals=judge_subgoals or None
         )
         state.last_verdict = verdict
         state.last_reason = reason

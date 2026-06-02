@@ -78,6 +78,28 @@ class NextAction:
     board: str | None = None
     task_id: str | None = None
     repo: str | None = None
+    required_evidence: str | None = None
+
+    def evidence_requirement(self) -> str:
+        if self.required_evidence:
+            return self.required_evidence
+        if self.board and self.task_id:
+            return (
+                f"Before claiming progress, cite durable evidence for "
+                f"`{self.board}/{self.task_id}`: a Kanban comment/status/run "
+                "summary, receipt artifact, gbrain page, git commit/PR, or "
+                "focused test/check output."
+            )
+        if self.repo:
+            return (
+                f"Before claiming progress, cite durable evidence for `{self.repo}`: "
+                "a run artifact, gbrain page, git commit/PR, or focused "
+                "test/check output."
+            )
+        return (
+            "Before claiming progress, cite durable evidence: a Kanban update, "
+            "run artifact, gbrain page, git commit/PR, or focused test/check output."
+        )
 
 
 @dataclass
@@ -349,6 +371,7 @@ def render_markdown(packet: ManagerPacket) -> str:
         f"- Kind: `{packet.next_action.kind}`",
         f"- Reason: {packet.next_action.reason}",
         f"- Command: `{packet.next_action.command}`",
+        f"- Required evidence: {packet.next_action.evidence_requirement()}",
     ]
     if packet.next_action.board:
         lines.append(f"- Board: `{packet.next_action.board}`")
@@ -431,6 +454,7 @@ def telegram_summary(packet: ManagerPacket) -> str:
         f"Next: {packet.next_action.kind}",
         f"Reason: {packet.next_action.reason}",
         f"Command: {packet.next_action.command}",
+        f"Evidence: {packet.next_action.evidence_requirement()}",
         f"Preflight failures: {packet.preflight.failure_count}",
         f"Blocked tasks: {packet.blocked_count}",
         f"Running tasks: {packet.running_count}",
@@ -454,6 +478,7 @@ def packet_to_json(packet: ManagerPacket) -> str:
             "board": packet.next_action.board,
             "task_id": packet.next_action.task_id,
             "repo": packet.next_action.repo,
+            "required_evidence": packet.next_action.evidence_requirement(),
         },
         "preflight": {
             "failures": packet.preflight.failure_count,

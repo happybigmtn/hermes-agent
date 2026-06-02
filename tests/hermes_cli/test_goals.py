@@ -372,6 +372,22 @@ class TestGoalManager:
         assert "packet-json" in prompt
         assert "Goal: keep improving the orchestrator" in prompt
 
+    def test_manager_goal_judge_requires_receipt_evidence(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-judge-receipt")
+        mgr.set("keep improving the orchestrator")
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "missing receipt", False)) as judge:
+            decision = mgr.evaluate_after_turn("I worked on the recommended task.")
+
+        assert decision["should_continue"] is True
+        passed_subgoals = judge.call_args.kwargs["subgoals"]
+        assert any("durable evidence" in item for item in passed_subgoals)
+        assert any("Kanban comment/status/run summary" in item for item in passed_subgoals)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired

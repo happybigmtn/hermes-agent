@@ -94,10 +94,12 @@ def test_next_action_flags_blocked_codexworker_for_repair(isolated_kanban_home):
     assert packet.next_action.board == "ludeme"
     assert packet.next_action.task_id == tid
     assert "unverified" in packet.next_action.reason
+    assert "Kanban comment/status/run" in packet.next_action.evidence_requirement()
     markdown = render_markdown(packet)
     assert "Dev Orchestrator Manager Next Action" in markdown
     assert tid in markdown
     assert "review-required" in markdown
+    assert "Required evidence:" in markdown
 
 
 def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home):
@@ -125,6 +127,33 @@ def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home
     summary = telegram_summary(packet)
     assert "Next: dispatch-task" in summary
     assert "Command:" in summary
+    assert "Evidence:" in summary
+
+
+def test_packet_json_includes_required_evidence(isolated_kanban_home):
+    from hermes_cli.dev_manager_next_action import packet_to_json
+
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    kb.create_board("ludeme")
+    conn = kb.connect(board="ludeme")
+    try:
+        tid = kb.create_task(conn, title="needs receipt", assignee="codexworker", priority=100)
+    finally:
+        conn.close()
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+    )
+    data = packet_to_json(packet)
+
+    assert tid in data
+    assert "required_evidence" in data
+    assert "durable evidence" in data
 
 
 def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
