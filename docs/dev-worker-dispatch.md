@@ -3,6 +3,11 @@
 `dev-worker-dispatch.py` is the canonical helper for starting or steering a
 supervised development worker from Hermes.
 
+For daily use, prefer the safer shortcuts:
+
+- `dnew`: create a supervised worker; refuses if it already exists
+- `dsteer`: message an existing worker; refuses if it does not exist
+
 It does four things in order:
 
 1. records a manager event in `~/.hermes/reports/dev-manager-events.jsonl`
@@ -11,6 +16,14 @@ It does four things in order:
 4. writes a dispatch artifact under `.auto/orchestrator`
 
 ## Start Codex
+
+Short form:
+
+```bash
+dnew ludeme "Continue the Ludeme campaign from the current plan"
+```
+
+Underlying command:
 
 ```bash
 ~/.hermes/scripts/dev-worker-dispatch.py \
@@ -21,6 +34,14 @@ It does four things in order:
 ```
 
 ## Steer Existing Worker
+
+Short form:
+
+```bash
+dsteer nullspaceton "If auto gen is stalled, write closeout and stop cleanly."
+```
+
+Underlying command:
 
 ```bash
 ~/.hermes/scripts/dev-worker-dispatch.py \

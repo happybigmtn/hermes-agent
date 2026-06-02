@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'EOF'
+Dev orchestrator shortcuts on orch
+
+Observe:
+  ds                         refresh status + print report summary
+  db                         print dashboard URL
+  dw                         list tmux workers
+  dtail <repo> [session]     show worker pane tail
+  dattach <repo> [session]   attach to worker tmux session
+
+Act:
+  dnew <repo> "<intent>" [command]
+     Create <repo>-codex, record manager event, send command.
+     Refuses if the session already exists.
+     Default command: codex --yolo
+
+  dstart <repo> "<intent>" [command]
+     Alias for dnew.
+
+  dsteer <repo> "<message>" ["intent"]
+     Send a steer to an existing <repo>-codex and record why.
+     Refuses if the session does not exist.
+
+  dclose <repo> [session]
+     Write supervision closeout report + gbrain page.
+
+Examples:
+  ds
+  db
+  dnew ludeme "Continue the Ludeme campaign from the current plan"
+  dsteer nullspaceton "If auto gen is stalled, write closeout and stop cleanly."
+  dtail nullspaceton
+  dclose nullspaceton
+
+Override session:
+  DSESSION=ludeme-claude dnew ludeme "Design critique only" "claude"
+EOF

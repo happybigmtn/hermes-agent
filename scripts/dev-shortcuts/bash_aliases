@@ -1,0 +1,23 @@
+# Dev orchestrator shortcuts.
+#
+# Executables live in ~/.local/bin so they also work through non-interactive
+# SSH. This file keeps a few shell-only helpers and readable aliases.
+
+alias dstatus='ds'
+alias dboard='db'
+alias dworkers='dw'
+
+dcd() {
+    if [ -z "${1:-}" ]; then
+        cd /srv/dev/repos || return
+        return
+    fi
+    if [ -d "/srv/dev/repos/$1" ]; then
+        cd "/srv/dev/repos/$1" || return
+    elif [ -d "$1" ]; then
+        cd "$1" || return
+    else
+        echo "repo not found: $1" >&2
+        return 2
+    fi
+}

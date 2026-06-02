@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$HOME/.hermes/scripts/dev-run-status.py" "$@"

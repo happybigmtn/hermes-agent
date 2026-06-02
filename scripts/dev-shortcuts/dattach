@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: dattach <repo> [session]
+
+Examples:
+  dattach nullspaceton
+  dattach ludeme ludeme-codex
+
+Default session: <repo>-codex
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "$#" -lt 1 ]; then
+  usage
+  exit 0
+fi
+
+repo_arg="$1"
+if [ -d "$repo_arg" ]; then
+  repo="$(cd "$repo_arg" && pwd)"
+elif [ -d "/srv/dev/repos/$repo_arg" ]; then
+  repo="/srv/dev/repos/$repo_arg"
+else
+  echo "repo not found: $repo_arg" >&2
+  exit 2
+fi
+
+slug="$(basename "$repo")"
+session="${2:-${DSESSION:-${slug}-codex}}"
+exec tmux attach -t "$session"

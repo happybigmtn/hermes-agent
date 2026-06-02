@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}' 2>/dev/null || true
