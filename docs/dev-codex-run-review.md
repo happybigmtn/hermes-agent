@@ -79,6 +79,12 @@ review result and records `codex-review-report`; the manager tick still exits
 zero after reporting. Cron failure should mean the manager script failed, not
 that Codex found code needing attention.
 
+After a reported review whose verdict is `FIX_FIRST`, `BLOCKED`, or otherwise
+not `READY_TO_MERGE`, Hermes should not hand the review to the human as the next
+step. The next manager tick steers the supervised Codex worker with the review
+artifact and repair/receipt instructions through `dev-worker-dispatch.py`, then
+continues monitoring for fresh evidence.
+
 ## Operator Rule
 
 Receipt grade is not merge-readiness. A `verified` receipt means the run left

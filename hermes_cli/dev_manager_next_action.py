@@ -47,6 +47,7 @@ from hermes_cli.dev_run_status import (
     collect_status,
     list_tmux_worker_sessions,
 )
+from hermes_cli.dev_worker_dispatch import dispatch_worker
 
 
 DEFAULT_GBRAIN_SLUG = "dev-orchestrator-manager-next-action"
@@ -61,6 +62,7 @@ ROUTINE_TELEGRAM_KINDS = {
     "dispatch-task",
     "wait-for-active-run",
     "wait-for-codex-review",
+    "repair-codex-review-blocker",
     "execute-plan-slice",
     "create-campaign-plan",
 }
@@ -175,6 +177,11 @@ class NextAction:
                 "Relay the completed Codex review result, record that it was "
                 "reported, and only ask the human if Codex returned a blocker "
                 "or fix-first decision."
+            )
+        if self.kind == "repair-codex-review-blocker":
+            return (
+                "Steer the existing Codex worker with the review artifact, "
+                "required fix/receipt instructions, and no human handoff."
             )
         if self.worker:
             return (
@@ -374,6 +381,62 @@ def _unreported_codex_review(worker: WorkerSession) -> ManagerEvent | None:
     if reported:
         return None
     return latest_finish
+
+
+def _review_output_text(event: ManagerEvent) -> str:
+    output_path = _review_output_path(event)
+    if not output_path or not output_path.exists():
+        return ""
+    return output_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _review_verdict(event: ManagerEvent) -> str | None:
+    line = _extract_prefixed_line(_review_output_text(event), "Verdict:")
+    if not line:
+        return None
+    return line.split(":", 1)[1].strip().split()[0].upper()
+
+
+def _codex_review_requires_repair(event: ManagerEvent) -> bool:
+    if event.event_type != "codex-review":
+        return False
+    verdict = _review_verdict(event)
+    if verdict:
+        return verdict != "READY_TO_MERGE"
+    return _review_returncode(event) != 0
+
+
+def _codex_review_was_reported(events: Sequence[ManagerEvent], review: ManagerEvent) -> bool:
+    return any(
+        event.event_type == "codex-review-report"
+        and _event_note_value(event, "reported_event") == review.id
+        for event in events
+    )
+
+
+def _repair_already_dispatched(events: Sequence[ManagerEvent], review: ManagerEvent) -> bool:
+    marker = f"review `{review.id}`"
+    return any(
+        event.event_type in {"worker-start", "worker-steer", "worker-resume"}
+        and event.created_at >= review.created_at
+        and marker in event.intent
+        for event in events
+    )
+
+
+def _unrepaired_codex_review_blocker(worker: WorkerSession) -> ManagerEvent | None:
+    events = _codex_review_events(worker)
+    reviews = [event for event in events if event.event_type == "codex-review"]
+    latest_review = _latest_event(reviews, {"codex-review"})
+    if latest_review is None:
+        return None
+    if not _codex_review_requires_repair(latest_review):
+        return None
+    if not _codex_review_was_reported(events, latest_review):
+        return None
+    if _repair_already_dispatched(events, latest_review):
+        return None
+    return latest_review
 
 
 def _git_line(repo: Path, args: Sequence[str]) -> str | None:
@@ -626,6 +689,23 @@ def recommend_next_action(
                 required_evidence=(
                     f"Before claiming review completion, cite the Codex review "
                     f"output artifact and codex-review manager event for commit `{commit}`."
+                ),
+            )
+        repair_review = _unrepaired_codex_review_blocker(worker)
+        if repair_review:
+            return NextAction(
+                kind="repair-codex-review-blocker",
+                repo=repo,
+                worker=target,
+                review_event_id=repair_review.id,
+                reason=(
+                    f"{target} has reported Codex review {repair_review.id} "
+                    "that requires worker repair"
+                ),
+                command="venv/bin/python scripts/hermes-dev-worker-dispatch.py",
+                required_evidence=(
+                    f"Before claiming repair dispatch, cite worker-steer evidence "
+                    f"for Codex review `{repair_review.id}`."
                 ),
             )
         if _worker_ready_for_codex_review_marker(worker, now=now):
@@ -1163,10 +1243,71 @@ def _report_codex_review_result(packet: ManagerPacket) -> SafeExecutionResult:
     )
 
 
+def _repair_review_message(review: ManagerEvent) -> str:
+    output_path = _review_output_path(review)
+    verdict = _review_verdict(review) or "ATTENTION"
+    artifact = str(output_path) if output_path else "the codex-review event artifacts"
+    return (
+        f"Hermes review repair: Codex review `{review.id}` returned `{verdict}`. "
+        f"Read `{artifact}`, inspect the target diff/commit yourself, fix the issue or "
+        "produce the missing machine-readable receipts, rerun focused validation, commit "
+        "only a verified product delta if needed, and write a concise closeout artifact. "
+        "Do not ask the human unless the blocker is outside repo/machine authority."
+    )
+
+
+def _dispatch_review_repair(packet: ManagerPacket) -> SafeExecutionResult:
+    action = packet.next_action
+    if not action.repo or not action.worker or not action.review_event_id:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary="Codex review repair dispatch failed: missing repo, worker, or review event id",
+            returncode=1,
+        )
+    events = matching_events(repo=action.repo, worker_session=action.worker, limit=50)
+    review = next((event for event in events if event.id == action.review_event_id), None)
+    if review is None:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"Codex review repair dispatch failed: event {action.review_event_id} not found",
+            returncode=1,
+        )
+    result = dispatch_worker(
+        repo=Path(action.repo),
+        session=_session_name(action.worker),
+        intent=f"Repair Codex review `{review.id}`",
+        message=_repair_review_message(review),
+        event_log=DEFAULT_EVENT_LOG,
+        event_type="worker-steer",
+        requested_by="hermes",
+        delivery_channel="telegram",
+        start_if_missing=False,
+        created_at=packet.generated_at,
+    )
+    failed = result.failed_results
+    return SafeExecutionResult(
+        kind=action.kind,
+        ok=not failed,
+        summary=(
+            "Codex review repair dispatched.\n"
+            f"repo: {result.repo}\n"
+            f"session: {result.session}\n"
+            f"event: {result.event.id}\n"
+            f"artifact: {result.artifact_path}"
+        ),
+        returncode=1 if failed else 0,
+        notify=bool(failed),
+    )
+
+
 def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecutionResult | None:
     action = packet.next_action
     if action.kind == "report-codex-review-result":
         return _report_codex_review_result(packet)
+    if action.kind == "repair-codex-review-blocker":
+        return _dispatch_review_repair(packet)
     if action.kind != "codex-review-worker" or not action.repo or not action.worker:
         return None
     return _dispatch_codex_review(packet, report_dir=report_dir)
