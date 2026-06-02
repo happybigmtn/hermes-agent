@@ -3820,6 +3820,54 @@ def resolve_provider_client(
                        "directly supported, try 'auto'", provider)
         return None, None
 
+    elif pconfig.auth_type == "oauth_minimax":
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+        except ImportError:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth requested but "
+                "MiniMax OAuth or Anthropic adapter support is unavailable"
+            )
+            return None, None
+
+        try:
+            creds = resolve_minimax_oauth_runtime_credentials(as_token_provider=True)
+        except Exception as exc:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth credentials unavailable: %s",
+                exc,
+            )
+            return None, None
+
+        api_key = explicit_api_key or creds.get("api_key")
+        base_url = (
+            explicit_base_url
+            or str(creds.get("base_url") or "").strip()
+            or pconfig.inference_base_url
+        ).rstrip("/")
+        if not api_key or not base_url:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth resolved incomplete credentials"
+            )
+            return None, None
+
+        final_model = _normalize_resolved_model(
+            model or _get_aux_model_for_provider(provider),
+            provider,
+        )
+        real_client = build_anthropic_client(api_key, base_url)
+        client = AnthropicAuxiliaryClient(
+            real_client,
+            final_model,
+            api_key,
+            base_url,
+            is_oauth=False,
+        )
+        logger.debug("resolve_provider_client: minimax-oauth (%s)", final_model)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
     logger.warning("resolve_provider_client: unhandled auth_type %s for %s",
                    pconfig.auth_type, provider)
     return None, None

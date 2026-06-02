@@ -57,6 +57,46 @@ def _clean_env(monkeypatch):
     _aux_mod._aux_unhealthy_logged_at.clear()
 
 
+def test_resolve_provider_client_supports_minimax_oauth_auxiliary(monkeypatch):
+    token_provider = lambda: "fresh-minimax-token"
+    built = {}
+    fake_real_client = SimpleNamespace()
+
+    def fake_credentials(*, as_token_provider=False, **_kwargs):
+        assert as_token_provider is True
+        return {
+            "api_key": token_provider,
+            "base_url": "https://api.minimax.io/anthropic",
+            "source": "oauth",
+        }
+
+    def fake_build_anthropic_client(api_key, base_url):
+        built["api_key"] = api_key
+        built["base_url"] = base_url
+        return fake_real_client
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_minimax_oauth_runtime_credentials",
+        fake_credentials,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client",
+        fake_build_anthropic_client,
+    )
+
+    client, model = resolve_provider_client("minimax-oauth", "MiniMax-M3")
+
+    assert model == "MiniMax-M3"
+    assert client is not None
+    assert client._real_client is fake_real_client
+    assert client.api_key is token_provider
+    assert client.base_url == "https://api.minimax.io/anthropic"
+    assert built == {
+        "api_key": token_provider,
+        "base_url": "https://api.minimax.io/anthropic",
+    }
+
+
 @pytest.fixture
 def codex_auth_dir(tmp_path, monkeypatch):
     """Provide a writable ~/.codex/ directory with a valid auth.json."""
