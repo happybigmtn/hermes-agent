@@ -963,15 +963,27 @@ class TestTelegramMenuCommands:
         assert len(names) == 30
         assert hidden > 0
         for name in (
+            "help",
+            "status",
+            "agents",
+            "goal",
+            "subgoal",
+            "mastery_answer",
+            "new",
+            "stop",
+            "queue",
+            "steer",
+            "background",
+            "approve",
+            "deny",
+            "model",
+            "reasoning",
+            "codex_runtime",
             "debug",
             "restart",
             "update",
             "verbose",
             "commands",
-            "help",
-            "new",
-            "stop",
-            "status",
         ):
             assert name in names
 

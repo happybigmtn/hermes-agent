@@ -513,19 +513,18 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
 
 
 _TELEGRAM_MENU_PRIORITY = (
-    # Most-typed everyday commands first.
+    # Development-manager controls: understand, steer, and advance work.
     "help",
+    "status",
+    "agents",
+    "goal",
+    "subgoal",
+    "mastery-answer",
+    # Session control.
     "new",
     "stop",
-    "status",
     "resume",
     "sessions",
-    "model",
-    # Maintenance / diagnostics — the ones that prompted this priority list.
-    "debug",
-    "restart",
-    "update",
-    "verbose",
     "commands",
     # Mid-turn session control.
     "approve",
@@ -533,13 +532,19 @@ _TELEGRAM_MENU_PRIORITY = (
     "queue",
     "steer",
     "background",
-    # Lower-priority but still useful operational built-ins.
+    # Model/runtime knobs.
+    "model",
     "reasoning",
-    "usage",
-    "platforms",
-    "platform",
-    "profile",
+    "codex-runtime",
+    # Maintenance / diagnostics.
     "whoami",
+    "profile",
+    "restart",
+    "debug",
+    "update",
+    "verbose",
+    "usage",
+    "platform",
 )
 """Built-in commands that should stay visible in Telegram's capped menu.
 
@@ -1017,6 +1022,8 @@ _SLACK_RESERVED_COMMANDS = frozenset({
     "who", "collapse", "expand", "leave", "join", "open", "search",
     "topic", "mute", "pro", "shortcuts",
 })
+_SLACK_ALIAS_PRIORITY = ("reset", "bg", "btw", "q")
+"""Alias slashes that should survive Slack's 50-command cap."""
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1078,14 +1085,27 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
-    for cmd in COMMAND_REGISTRY:
+    # Second pass: aliases. Keep the most-used aliases above lower-priority
+    # aliases when Slack's 50-command cap leaves only a few slots.
+    alias_priority = {
+        name: index for index, name in enumerate(_SLACK_ALIAS_PRIORITY)
+    }
+    alias_entries: list[tuple[int, int, int, CommandDef, str]] = []
+    for cmd_index, cmd in enumerate(COMMAND_REGISTRY):
         if not _is_gateway_available(cmd, overrides):
             continue
-        for alias in cmd.aliases:
-            # Skip aliases that only differ from canonical by case/punctuation
-            # normalization (already covered by _add dedup).
-            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+        for alias_index, alias in enumerate(cmd.aliases):
+            alias_entries.append((
+                alias_priority.get(alias, len(alias_priority)),
+                cmd_index,
+                alias_index,
+                cmd,
+                alias,
+            ))
+    for _priority, _cmd_index, _alias_index, cmd, alias in sorted(alias_entries):
+        # Skip aliases that only differ from canonical by case/punctuation
+        # normalization (already covered by _add dedup).
+        _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # Third pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():

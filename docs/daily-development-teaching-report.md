@@ -86,6 +86,9 @@ When the human answers, pipe that answer into:
 In Telegram, the normal path is simpler: reply directly to the mastery prompt,
 or send `/mastery_answer <answer>`. Hermes routes both forms through the same
 answer recorder without invoking the LLM or interrupting an active agent run.
+The Telegram command menu intentionally prioritizes development-manager
+commands such as `/agents`, `/goal`, `/subgoal`, and `/mastery_answer` because
+Telegram only shows the first 30 registered bot commands.
 
 The answer command writes `daily-mastery-answer-YYYYMMDD-HHMMSS.md`, updates the
 running checklist only when the answer names concrete evidence, syncs the answer
