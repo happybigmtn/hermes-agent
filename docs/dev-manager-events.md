@@ -11,6 +11,19 @@ Default ledger:
 
 ## Record
 
+For normal worker launches or steers, prefer the dispatch helper:
+
+```bash
+~/.hermes/scripts/dev-worker-dispatch.py \
+  --repo /srv/dev/repos/nullspaceton \
+  --session nullspaceton-codex \
+  --intent "Run autodev corpus/gen, then execute the queued winner WATER slice." \
+  --message "codex --yolo"
+```
+
+Use the lower-level event command when recording an event without touching
+tmux:
+
 ```bash
 ~/.hermes/scripts/dev-manager-events.py record \
   --repo /srv/dev/repos/nullspaceton \

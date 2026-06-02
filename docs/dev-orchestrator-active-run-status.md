@@ -93,29 +93,41 @@ For Codex on Ludeme:
 
 ```bash
 ssh orch
-tmux new -As ludeme-codex -c /srv/dev/repos/ludeme
-codex --yolo
+~/.hermes/scripts/dev-worker-dispatch.py \
+  --repo /srv/dev/repos/ludeme \
+  --session ludeme-codex \
+  --intent "Start supervised Codex work on Ludeme" \
+  --message "codex --yolo"
 ```
 
-Hermes sees that pane in the active-run dashboard as a worker row with:
+Hermes records the manager event, starts or reuses the tmux session, sends the
+message, writes a dispatch artifact, and then shows the pane in the active-run
+dashboard as a worker row with:
 
 - target, for example `ludeme-codex:0.0`
 - inferred kind, for example `codex`
 - pane command and current path
+- latest manager event
 - steering command, for example
   `tmux send-keys -t ludeme-codex:0.0 '<message>' C-m`
 
 Use this pattern for other repos:
 
 ```bash
-tmux new -As <repo>-codex -c /srv/dev/repos/<repo>
-tmux new -As <repo>-claude -c /srv/dev/repos/<repo>
-tmux new -As <repo>-auto -c /srv/dev/repos/<repo>
+~/.hermes/scripts/dev-worker-dispatch.py \
+  --repo /srv/dev/repos/<repo> \
+  --session <repo>-codex \
+  --intent "<operator intent>" \
+  --message "codex --yolo"
 ```
 
 The operator should tell Hermes which tmux session owns the campaign. Hermes
 should then treat stale or idle panes as supervision targets, not as missing
 work.
+
+Use raw `tmux new-session` or `tmux send-keys` only for local debugging. For an
+orchestrated campaign, `dev-worker-dispatch.py` is the evidence-preserving
+entry point.
 
 ## Operator Rule
 

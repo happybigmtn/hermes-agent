@@ -71,14 +71,14 @@ Use `--no-steer-history` only when debugging the closeout command itself.
 
 ## Manager Event Ledger
 
-Record an explicit manager action before launching or steering a worker:
+Prefer `dev-worker-dispatch.py` when launching or steering a worker:
 
 ```bash
-~/.hermes/scripts/dev-manager-events.py record \
+~/.hermes/scripts/dev-worker-dispatch.py \
   --repo /srv/dev/repos/nullspaceton \
-  --worker-session nullspaceton-codex \
+  --session nullspaceton-codex \
   --intent "Run autodev corpus/gen, then execute the queued winner WATER slice." \
-  --artifact .auto/orchestrator/nullspaceton-codex-20260602T033603Z/prompt.md
+  --message "codex --yolo"
 ```
 
 List recent matching events:
@@ -100,7 +100,6 @@ whether to continue, steer, review, or commit.
 
 ## Current Gap
 
-The closeout command can cite explicit manager events, but Hermes gateway and
-tmux launch paths still need to record those events automatically at dispatch
-time. Until that integration is complete, call `dev-manager-events.py record`
-when launching or steering long-running workers.
+The closeout command can cite explicit manager events, and
+`dev-worker-dispatch.py` records them before touching tmux. Hermes gateway and
+Kanban launch paths still need to call that helper automatically.
