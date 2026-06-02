@@ -16,6 +16,7 @@ from hermes_cli.dev_manager_next_action import (
     write_gbrain_page,
 )
 from hermes_cli.dev_orchestrator_preflight import Check, PreflightResult, ProfilePreflight
+from hermes_cli.dev_run_status import WorkerSession
 
 
 @pytest.fixture
@@ -88,6 +89,7 @@ def test_next_action_flags_blocked_codexworker_for_repair(isolated_kanban_home):
         recent_after=now - timedelta(hours=12),
         preflight=_preflight(now),
         runs=[],
+        workers=[],
     )
 
     assert packet.next_action.kind == "repair-blocked-task"
@@ -96,13 +98,57 @@ def test_next_action_flags_blocked_codexworker_for_repair(isolated_kanban_home):
     assert "unverified" in packet.next_action.reason
     assert "Kanban comment/status/run" in packet.next_action.evidence_requirement()
     markdown = render_markdown(packet)
-    assert "Dev Orchestrator Manager Next Action" in markdown
+    assert "Dev Orchestrator Manager Tick" in markdown
     assert tid in markdown
     assert "review-required" in markdown
     assert "Evidence after:" in markdown
     assert now.isoformat() in markdown
     assert "Required evidence:" in markdown
     assert "Evidence must be fresh" in markdown
+
+
+def test_next_action_supervises_active_worker_before_stale_board_packets(isolated_kanban_home):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    kb.create_board("ludeme")
+    conn = kb.connect(board="ludeme")
+    try:
+        kb.create_task(
+            conn,
+            title="blocked but not more important than the live worker",
+            assignee="codexworker",
+            priority=100,
+        )
+    finally:
+        conn.close()
+
+    worker = WorkerSession(
+        session_name="ludeme-codex",
+        window_index="0",
+        pane_index="0",
+        pane_pid=123,
+        current_command="node",
+        current_path=Path("/srv/dev/repos/ludeme"),
+        active=True,
+        dead=False,
+        title="codex",
+    )
+
+    packet = collect_manager_packet(
+        now=now,
+        repo_roots=[],
+        stale_after=timedelta(minutes=30),
+        recent_after=now - timedelta(hours=12),
+        preflight=_preflight(now),
+        runs=[],
+        workers=[worker],
+    )
+
+    assert packet.next_action.kind == "supervise-interactive-worker"
+    assert packet.next_action.worker == "ludeme-codex:0.0"
+    summary = telegram_summary(packet)
+    assert "Human action: None by default" in summary
+    assert "Command:" not in summary
+    assert "Interactive workers: 1" in summary
 
 
 def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home):
@@ -122,16 +168,17 @@ def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home
         recent_after=now - timedelta(hours=12),
         preflight=_preflight(now),
         runs=[],
+        workers=[],
     )
 
     assert packet.next_action.kind == "dispatch-task"
     assert packet.next_action.task_id == high
     assert packet.next_action.task_id != low
     summary = telegram_summary(packet)
-    assert "Next: dispatch-task" in summary
-    assert "Command:" in summary
-    assert f"Evidence after: {now.isoformat()}" in summary
-    assert "Evidence:" in summary
+    assert "Hermes next: dispatch-task" in summary
+    assert "Command:" not in summary
+    assert "Human action: None by default" in summary
+    assert "Evidence required:" in summary
     assert "not copied from prior runs" in summary
 
 
@@ -153,12 +200,15 @@ def test_packet_json_includes_required_evidence(isolated_kanban_home):
         recent_after=now - timedelta(hours=12),
         preflight=_preflight(now),
         runs=[],
+        workers=[],
     )
     data = packet_to_json(packet)
 
     assert tid in data
     assert '"evidence_after": "2026-06-02T01:45:00+00:00"' in data
     assert "required_evidence" in data
+    assert "human_action" in data
+    assert "manager_instruction" in data
     assert "durable evidence" in data
     assert "Evidence must be fresh" in data
 
@@ -179,4 +229,4 @@ def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
     assert seen["args"][:4] == ["gbrain", "put", "next-action-slug", "--content"]
     assert seen["kwargs"]["cwd"] == "/tmp"
     assert "input" not in seen["kwargs"]
-    assert "Dev Orchestrator Manager Next Action" in seen["args"][4]
+    assert "Dev Orchestrator Manager Tick" in seen["args"][4]

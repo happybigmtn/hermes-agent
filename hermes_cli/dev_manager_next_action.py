@@ -1,10 +1,10 @@
-"""Deterministic next-action packet for the dev orchestrator manager loop.
+"""Deterministic supervision tick for the dev orchestrator manager loop.
 
 The active-run status report answers "what is running?". This module answers
-"what should the manager do next?" from durable state: profile preflight,
-Kanban boards, and recent orchestrator run artifacts. It is intentionally
-no-agent friendly so Hermes can schedule it before any broad model-driven
-campaign continuation.
+"what should Hermes manage next?" from durable state: profile preflight,
+interactive workers, Kanban boards, and recent orchestrator run artifacts. It
+is intentionally no-agent friendly so Hermes can schedule it before any broad
+model-driven campaign continuation.
 """
 
 from __future__ import annotations
@@ -32,9 +32,11 @@ from hermes_cli.dev_run_status import (
     DEFAULT_REPORT_DIR,
     DEFAULT_STALE_MINUTES,
     RunSummary,
+    WorkerSession,
     _parse_csv,
     _repo_roots,
     collect_status,
+    list_tmux_worker_sessions,
 )
 
 
@@ -78,11 +80,19 @@ class NextAction:
     board: str | None = None
     task_id: str | None = None
     repo: str | None = None
+    worker: str | None = None
     required_evidence: str | None = None
 
     def evidence_requirement(self, *, evidence_after: datetime | None = None) -> str:
         if self.required_evidence:
             base = self.required_evidence
+        elif self.worker:
+            base = (
+                f"Before claiming progress, cite durable evidence for worker "
+                f"`{self.worker}`: a manager event, supervision closeout, "
+                "gbrain page, git commit/PR, run artifact, or focused "
+                "test/check output."
+            )
         elif self.board and self.task_id:
             base = (
                 f"Before claiming progress, cite durable evidence for "
@@ -109,11 +119,46 @@ class NextAction:
             "prior runs."
         )
 
+    def manager_instruction(self) -> str:
+        if self.worker:
+            return (
+                "Inspect the worker pane, repo status, and recent artifacts. If "
+                "the worker is still productive, keep monitoring. If it is idle, "
+                "blocked, or complete, steer it or write a supervision closeout "
+                "and sync the evidence to gbrain before reporting progress."
+            )
+        if self.kind == "fix-preflight":
+            return "Repair the failing profile/tool setup before dispatching more work."
+        if self.kind in {"repair-blocked-task", "inspect-stale-task"}:
+            return (
+                "Inspect the task evidence, decide whether to unblock, close out, "
+                "or re-dispatch, then update Kanban/gbrain with fresh evidence."
+            )
+        if self.kind == "inspect-run-attention":
+            return "Inspect the run root and latest artifacts, then either resume narrowly or close it out."
+        if self.kind == "run-review":
+            return "Run the review gate and record the decision before more implementation."
+        if self.kind == "dispatch-task":
+            return "Dispatch the highest-value unblocked task and require fresh evidence before claiming progress."
+        if self.kind == "wait-for-active-run":
+            return "Keep monitoring the active run and refresh status/gbrain instead of starting competing work."
+        if self.kind == "execute-plan-slice":
+            return "Execute the smallest useful slice from the plan, validate it, and close out with evidence."
+        if self.kind == "create-campaign-plan":
+            return "Read gbrain context, run autodev planning surfaces, and create precise executable work."
+        return "Take the manager action and write fresh durable evidence before reporting progress."
+
+    def human_action(self) -> str:
+        if self.kind == "fix-preflight":
+            return "Only if Hermes cannot repair the profile without new credentials or destructive access."
+        return "None by default; Hermes should do this itself and report only evidence or a true blocker."
+
 
 @dataclass
 class ManagerPacket:
     generated_at: datetime
     preflight: PreflightResult
+    workers: list[WorkerSession]
     boards: list[BoardSnapshot]
     runs: list[RunSummary]
     next_action: NextAction
@@ -128,6 +173,28 @@ class ManagerPacket:
     @property
     def running_count(self) -> int:
         return sum(board.counts.get("running", 0) for board in self.boards)
+
+    @property
+    def worker_count(self) -> int:
+        return sum(1 for worker in self.workers if not worker.dead)
+
+
+def _live_supervised_workers(workers: Sequence[WorkerSession]) -> list[WorkerSession]:
+    supervised = [
+        worker
+        for worker in workers
+        if not worker.dead and worker.kind() in {"codex", "claude", "autodev"}
+    ]
+    supervised.sort(
+        key=lambda worker: (
+            not worker.active,
+            worker.kind() != "codex",
+            worker.session_name,
+            worker.window_index,
+            worker.pane_index,
+        )
+    )
+    return supervised
 
 
 def _unix_age(now: datetime, unix_time: int | None) -> timedelta | None:
@@ -232,6 +299,7 @@ def collect_board_snapshots(
 def recommend_next_action(
     *,
     preflight: PreflightResult,
+    workers: Sequence[WorkerSession] = (),
     boards: Sequence[BoardSnapshot],
     runs: Sequence[RunSummary],
 ) -> NextAction:
@@ -243,6 +311,30 @@ def recommend_next_action(
                 reason=f"{profile.name} profile failing `{first.name}`: {first.detail}",
                 command="venv/bin/python scripts/hermes-dev-orchestrator-preflight.py",
             )
+
+    live_workers = _live_supervised_workers(workers)
+    if live_workers:
+        worker = live_workers[0]
+        target = worker.target()
+        repo = str(worker.current_path) if worker.current_path else None
+        return NextAction(
+            kind="supervise-interactive-worker",
+            repo=repo,
+            worker=target,
+            reason=(
+                f"{target} is a live {worker.kind()} worker; supervise the "
+                "live session before acting on stale board packets or starting "
+                "more work"
+            ),
+            command=(
+                "venv/bin/python scripts/hermes-dev-run-status.py --no-gbrain"
+                + (
+                    f" && venv/bin/python scripts/hermes-dev-supervision-closeout.py --repo {worker.current_path} --session {worker.session_name} --no-gbrain"
+                    if worker.current_path
+                    else ""
+                )
+            ),
+        )
 
     for board in boards:
         stale = [task for task in board.tasks if task.stale]
@@ -344,8 +436,10 @@ def collect_manager_packet(
     board_slugs: Sequence[str] | None = None,
     preflight: PreflightResult | None = None,
     runs: Sequence[RunSummary] | None = None,
+    workers: Sequence[WorkerSession] | None = None,
 ) -> ManagerPacket:
     preflight_result = preflight or collect_preflight(now=now)
+    worker_summaries = list(workers) if workers is not None else list_tmux_worker_sessions()
     boards = collect_board_snapshots(board_slugs=board_slugs, now=now, stale_after=stale_after)
     run_summaries = list(runs) if runs is not None else collect_status(
         repo_roots=repo_roots,
@@ -353,10 +447,16 @@ def collect_manager_packet(
         stale_after=stale_after,
         recent_after=recent_after,
     )
-    next_action = recommend_next_action(preflight=preflight_result, boards=boards, runs=run_summaries)
+    next_action = recommend_next_action(
+        preflight=preflight_result,
+        workers=worker_summaries,
+        boards=boards,
+        runs=run_summaries,
+    )
     return ManagerPacket(
         generated_at=now,
         preflight=preflight_result,
+        workers=worker_summaries,
         boards=boards,
         runs=run_summaries,
         next_action=next_action,
@@ -365,20 +465,23 @@ def collect_manager_packet(
 
 def render_markdown(packet: ManagerPacket) -> str:
     lines = [
-        "# Dev Orchestrator Manager Next Action",
+        "# Dev Orchestrator Manager Tick",
         "",
         f"Generated: {packet.generated_at.isoformat()}",
         f"Preflight failures: {packet.preflight.failure_count}",
+        f"Interactive workers: {packet.worker_count}",
         f"Boards: {len(packet.boards)}",
         f"Blocked tasks: {packet.blocked_count}",
         f"Running tasks: {packet.running_count}",
         f"Recent runs: {len(packet.runs)}",
         "",
-        "## Recommended Next Action",
+        "## Hermes Manager Action",
         "",
         f"- Kind: `{packet.next_action.kind}`",
         f"- Reason: {packet.next_action.reason}",
-        f"- Command: `{packet.next_action.command}`",
+        f"- Manager instruction: {packet.next_action.manager_instruction()}",
+        f"- Human action: {packet.next_action.human_action()}",
+        f"- Internal command: `{packet.next_action.command}`",
         f"- Evidence after: `{packet.generated_at.isoformat()}`",
         f"- Required evidence: {packet.next_action.evidence_requirement(evidence_after=packet.generated_at)}",
     ]
@@ -388,6 +491,16 @@ def render_markdown(packet: ManagerPacket) -> str:
         lines.append(f"- Task: `{packet.next_action.task_id}`")
     if packet.next_action.repo:
         lines.append(f"- Repo: `{packet.next_action.repo}`")
+    if packet.next_action.worker:
+        lines.append(f"- Worker: `{packet.next_action.worker}`")
+    lines.extend(["", "## Interactive Workers", ""])
+    if not packet.workers:
+        lines.append("No interactive tmux workers found.")
+    for worker in packet.workers:
+        state = "dead" if worker.dead else "active" if worker.active else "idle"
+        lines.append(
+            f"- `{worker.target()}` {worker.kind()} {state}; command=`{worker.current_command or 'unknown'}`; path=`{worker.current_path or 'unknown'}`"
+        )
     lines.extend(["", "## Boards", ""])
     for board in packet.boards:
         if not board.counts:
@@ -421,7 +534,7 @@ def render_markdown(packet: ManagerPacket) -> str:
 def write_gbrain_page(slug: str, markdown: str) -> str | None:
     if not shutil.which("gbrain"):
         return "gbrain binary not found"
-    body = "---\ntype: report\ntitle: Dev Orchestrator Manager Next Action\n---\n\n" + markdown
+    body = "---\ntype: report\ntitle: Dev Orchestrator Manager Tick\n---\n\n" + markdown
     try:
         result = subprocess.run(
             ["gbrain", "put", slug, "--content", body],
@@ -459,13 +572,14 @@ def write_packet_report(
 
 def telegram_summary(packet: ManagerPacket) -> str:
     lines = [
-        "Dev manager next-action packet ready.",
-        f"Next: {packet.next_action.kind}",
-        f"Reason: {packet.next_action.reason}",
-        f"Command: {packet.next_action.command}",
-        f"Evidence after: {packet.generated_at.isoformat()}",
-        f"Evidence: {packet.next_action.evidence_requirement(evidence_after=packet.generated_at)}",
+        "Dev manager supervision tick ready.",
+        f"Hermes next: {packet.next_action.kind}",
+        f"Why: {packet.next_action.reason}",
+        f"Manager instruction: {packet.next_action.manager_instruction()}",
+        f"Human action: {packet.next_action.human_action()}",
+        f"Evidence required: {packet.next_action.evidence_requirement(evidence_after=packet.generated_at)}",
         f"Preflight failures: {packet.preflight.failure_count}",
+        f"Interactive workers: {packet.worker_count}",
         f"Blocked tasks: {packet.blocked_count}",
         f"Running tasks: {packet.running_count}",
     ]
@@ -488,6 +602,9 @@ def packet_to_json(packet: ManagerPacket) -> str:
             "board": packet.next_action.board,
             "task_id": packet.next_action.task_id,
             "repo": packet.next_action.repo,
+            "worker": packet.next_action.worker,
+            "manager_instruction": packet.next_action.manager_instruction(),
+            "human_action": packet.next_action.human_action(),
             "evidence_after": packet.generated_at.isoformat(),
             "required_evidence": packet.next_action.evidence_requirement(
                 evidence_after=packet.generated_at
@@ -497,6 +614,17 @@ def packet_to_json(packet: ManagerPacket) -> str:
             "failures": packet.preflight.failure_count,
             "warnings": packet.preflight.warning_count,
         },
+        "workers": [
+            {
+                "target": worker.target(),
+                "kind": worker.kind(),
+                "active": worker.active,
+                "dead": worker.dead,
+                "command": worker.current_command,
+                "path": str(worker.current_path) if worker.current_path else None,
+            }
+            for worker in packet.workers
+        ],
         "boards": [
             {
                 "slug": board.slug,

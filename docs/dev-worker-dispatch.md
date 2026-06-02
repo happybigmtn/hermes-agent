@@ -1,12 +1,20 @@
 # Dev Worker Dispatch
 
+The manager role is defined in
+[`dev-orchestrator-manager-contract.md`](dev-orchestrator-manager-contract.md).
+This helper is an internal control-plane primitive. It is not the user-facing
+workflow by itself.
+
 `dev-worker-dispatch.py` is the canonical helper for starting or steering a
 supervised development worker from Hermes.
 
-For daily use, prefer the safer shortcuts:
+For direct shell debugging, the shortcuts are:
 
 - `dnew`: create a supervised worker; refuses if it already exists
 - `dsteer`: message an existing worker; refuses if it does not exist
+
+Normal operation should happen through Telegram/Hermes. The human should not
+need to remember these helpers for routine supervision.
 
 It does four things in order:
 

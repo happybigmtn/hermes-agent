@@ -1,5 +1,10 @@
 # Dev Orchestrator Active Run Status
 
+The manager role is defined in
+[`dev-orchestrator-manager-contract.md`](dev-orchestrator-manager-contract.md).
+This status reporter is only an observability input for that role; it is not
+the manager itself.
+
 Hermes can run a deterministic status reporter for active autodev/pilot runs.
 This is the operator-facing complement to the daily teaching report: the daily
 report explains what landed after commits exist, while this reporter explains
