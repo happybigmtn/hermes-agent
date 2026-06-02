@@ -71,7 +71,10 @@ The mastery-check cron runs shortly after the PDF. It reads the latest
 `HUMAN-UNDERSTANDING-CHECKLIST.md` section, writes
 `daily-mastery-check-YYYYMMDD-HHMMSS.md`, syncs the latest prompt to gbrain page
 `development-mastery-check-latest`, and sends a Telegram prompt asking the human
-to answer each checklist item before the next broad orchestration run.
+to answer the first unresolved checklist stage before the next broad
+orchestration run. Later stages remain visible, but the prompt deliberately
+keeps only one current stage active so the teaching loop is incremental instead
+of a single end-of-day quiz.
 
 ## Teaching Standard
 
@@ -91,8 +94,9 @@ human can explain it in her own words.
 
 The mastery prompt is deliberately active. Its job is to stop the workflow from
 silently moving from "report generated" to "understanding achieved." The human
-should answer with concrete repos, branches, commits, artifacts, tests, and
-blockers.
+should answer the current stage with concrete repos, branches, commits,
+artifacts, tests, and blockers. Hermes should leave later stages unresolved
+until the current answer is concrete enough to show real understanding.
 
 ## Manual Verification
 

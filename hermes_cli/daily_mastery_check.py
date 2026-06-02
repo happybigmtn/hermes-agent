@@ -41,6 +41,8 @@ class MasteryCheckResult:
     checklist_path: Path
     section_title: str | None
     question_count: int
+    current_stage: str | None
+    remaining_stage_count: int
     gbrain_slug: str | None
     gbrain_error: str | None
 
@@ -115,16 +117,22 @@ def build_mastery_markdown(
             f"Commits: {section.fields.get('Commits', 'unknown')}",
             f"Orchestrator phases: {section.fields.get('Orchestrator phases', 'unknown')}",
             "",
-            "## Mastery Questions",
+            "## Current Mastery Stage",
             "",
-            "Answer these before treating the development session as understood.",
+            "Answer this stage before treating the development session as ready for the next stage.",
             "",
         ]
     )
-    for index, item in enumerate(section.unchecked_items, start=1):
-        lines.append(f"{index}. {item}")
-    if not section.unchecked_items:
+    current_stage = section.unchecked_items[0] if section.unchecked_items else None
+    later_stages = section.unchecked_items[1:]
+    if current_stage:
+        lines.append(f"1. {current_stage}")
+    else:
         lines.append("No unchecked mastery items remain in the latest checklist section.")
+    if later_stages:
+        lines.extend(["", "## Later Stages", ""])
+        for index, item in enumerate(later_stages, start=2):
+            lines.append(f"{index}. {item}")
     lines.extend(
         [
             "",
@@ -134,10 +142,11 @@ def build_mastery_markdown(
             "- Explain the problem before the solution.",
             "- Distinguish landed commits from in-flight orchestrator work.",
             "- Leave checklist items unchecked when an answer is vague.",
+            "- Do not move to later stages until the current stage is answered concretely.",
             "",
             "## Next Action",
             "",
-            "Reply in Telegram with answers in the same order, or open the PDF and checklist before continuing the next broad orchestration run.",
+            "Reply in Telegram with the current-stage answer, or open the PDF and checklist before continuing the next broad orchestration run.",
             "",
         ]
     )
@@ -179,7 +188,9 @@ def generate_mastery_check(
         markdown_path=markdown_path,
         checklist_path=checklist_path,
         section_title=section.title if section else None,
-        question_count=len(section.unchecked_items) if section else 0,
+        question_count=1 if section and section.unchecked_items else 0,
+        current_stage=section.unchecked_items[0] if section and section.unchecked_items else None,
+        remaining_stage_count=max(0, len(section.unchecked_items) - 1) if section else 0,
         gbrain_slug=None if gbrain_error or not write_gbrain else gbrain_slug,
         gbrain_error=gbrain_error,
     )
@@ -189,7 +200,8 @@ def telegram_summary(result: MasteryCheckResult) -> str:
     lines = [
         "Daily development mastery check ready.",
         f"Report section: {result.section_title or 'missing'}",
-        f"Questions: {result.question_count}",
+        f"Current stage: {result.current_stage or 'none'}",
+        f"Later stages remaining: {result.remaining_stage_count}",
         f"Prompt: {result.markdown_path}",
         f"Checklist: {result.checklist_path}",
     ]
