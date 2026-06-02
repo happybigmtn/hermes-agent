@@ -62,6 +62,7 @@ ROUTINE_TELEGRAM_KINDS = {
     "dispatch-task",
     "wait-for-active-run",
     "wait-for-codex-review",
+    "report-codex-review-result",
     "repair-codex-review-blocker",
     "execute-plan-slice",
     "create-campaign-plan",
@@ -360,10 +361,20 @@ def _pending_codex_review(worker: WorkerSession, *, now: datetime, since: dateti
 
 
 def _unreported_codex_review(worker: WorkerSession) -> ManagerEvent | None:
+    events = _codex_review_events(worker)
     latest_start = _latest_codex_review_start(worker)
     if latest_start is None:
+        latest_finish = _latest_event(
+            [event for event in events if event.event_type == "codex-review"],
+            {"codex-review"},
+        )
+        if (
+            latest_finish is not None
+            and _review_returncode(latest_finish) != 0
+            and not _codex_review_was_reported(events, latest_finish)
+        ):
+            return latest_finish
         return None
-    events = _codex_review_events(worker)
     finished = [
         event
         for event in events
@@ -390,8 +401,25 @@ def _review_output_text(event: ManagerEvent) -> str:
     return output_path.read_text(encoding="utf-8", errors="replace")
 
 
+def _review_stdout_text(event: ManagerEvent) -> str:
+    text = _review_output_text(event)
+    if "## Stdout" not in text:
+        return text
+    stdout = text.split("## Stdout", 1)[1]
+    stdout = stdout.split("## Stderr", 1)[0]
+    stdout = stdout.strip()
+    if stdout.startswith("```"):
+        lines = stdout.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stdout = "\n".join(lines).strip()
+    return stdout
+
+
 def _review_verdict(event: ManagerEvent) -> str | None:
-    line = _extract_prefixed_line(_review_output_text(event), "Verdict:")
+    line = _extract_prefixed_line(_review_stdout_text(event), "Verdict:")
     if not line:
         return None
     return line.split(":", 1)[1].strip().split()[0].upper()
@@ -400,10 +428,12 @@ def _review_verdict(event: ManagerEvent) -> str | None:
 def _codex_review_requires_repair(event: ManagerEvent) -> bool:
     if event.event_type != "codex-review":
         return False
+    if _review_returncode(event) != 0:
+        return True
     verdict = _review_verdict(event)
     if verdict:
         return verdict != "READY_TO_MERGE"
-    return _review_returncode(event) != 0
+    return False
 
 
 def _codex_review_was_reported(events: Sequence[ManagerEvent], review: ManagerEvent) -> bool:
@@ -440,6 +470,13 @@ def _unrepaired_codex_review_blocker(worker: WorkerSession) -> ManagerEvent | No
 
 
 def _git_line(repo: Path, args: Sequence[str]) -> str | None:
+    lines = _git_lines(repo, args)
+    if not lines:
+        return None
+    return "\n".join(lines).strip() or None
+
+
+def _git_lines(repo: Path, args: Sequence[str]) -> list[str]:
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), *args],
@@ -449,11 +486,15 @@ def _git_line(repo: Path, args: Sequence[str]) -> str | None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return []
     if result.returncode != 0:
-        return None
+        return []
     text = result.stdout.strip()
-    return text or None
+    return text.splitlines() if text else []
+
+
+def _repo_has_uncommitted_changes(repo: Path) -> bool:
+    return bool(_git_lines(repo, ["status", "--porcelain"]))
 
 
 def _latest_commit(repo: Path) -> tuple[str, datetime, str] | None:
@@ -488,6 +529,13 @@ def _latest_codex_review(worker: WorkerSession) -> ManagerEvent | None:
     )
 
 
+def _latest_any_codex_review(worker: WorkerSession) -> ManagerEvent | None:
+    return _latest_event(
+        [event for event in _codex_review_events(worker) if event.event_type == "codex-review"],
+        {"codex-review"},
+    )
+
+
 def _latest_worker_dispatch(worker: WorkerSession) -> ManagerEvent | None:
     return _latest_event(_codex_review_events(worker), {"worker-start", "worker-steer", "worker-resume"})
 
@@ -502,7 +550,7 @@ def _unreviewed_worker_commit(worker: WorkerSession, *, now: datetime) -> tuple[
     latest_dispatch = _latest_worker_dispatch(worker)
     if latest_dispatch is not None and committed_at < latest_dispatch.created_at:
         return None
-    latest_review = _latest_codex_review(worker)
+    latest_review = _latest_any_codex_review(worker)
     if latest_review is not None and latest_review.created_at >= committed_at:
         return None
     if _pending_codex_review(worker, now=now, since=committed_at) is not None:
@@ -666,6 +714,22 @@ def recommend_next_action(
                 review_event_id=pending_review.id,
                 reason=f"{target} already has Codex review {pending_review.id} in progress",
                 command="venv/bin/python scripts/hermes-dev-manager-events.py list",
+            )
+        if worker.kind() == "codex" and worker.current_path and _repo_has_uncommitted_changes(worker.current_path):
+            return NextAction(
+                kind="supervise-interactive-worker",
+                repo=repo,
+                worker=target,
+                reason=(
+                    f"{target} has uncommitted repo changes; supervise the live "
+                    "worker before reviewing a stale commit"
+                ),
+                command=f"git -C {shlex.quote(str(worker.current_path))} status --short --branch",
+                required_evidence=(
+                    f"Before claiming the dirty worker is handled, cite a fresh "
+                    f"closeout, commit, or status artifact for `{target}` after "
+                    f"`{now.isoformat()}`."
+                ),
             )
         unreviewed_commit = _unreviewed_worker_commit(worker, now=now)
         if unreviewed_commit:
@@ -1179,9 +1243,7 @@ def _first_review_line(text: str) -> str | None:
 
 def _review_event_summary(event: ManagerEvent) -> str:
     output_path = _review_output_path(event)
-    text = ""
-    if output_path and output_path.exists():
-        text = output_path.read_text(encoding="utf-8", errors="replace")
+    text = _review_stdout_text(event)
     verdict = _extract_prefixed_line(text, "Verdict:")
     confidence = _extract_prefixed_line(text, "Confidence:")
     review_line = None if verdict else _first_review_line(text)
@@ -1313,6 +1375,16 @@ def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecu
     return _dispatch_codex_review(packet, report_dir=report_dir)
 
 
+def _should_print_execution_result(
+    result: SafeExecutionResult,
+    *,
+    quiet_routine: bool,
+) -> bool:
+    if quiet_routine and result.ok and result.kind in ROUTINE_TELEGRAM_KINDS:
+        return False
+    return result.notify
+
+
 def packet_to_json(packet: ManagerPacket) -> str:
     data = {
         "generated_at": packet.generated_at.isoformat(),
@@ -1438,7 +1510,10 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
-    elif execution_result and execution_result.notify:
+    elif execution_result and _should_print_execution_result(
+        execution_result,
+        quiet_routine=args.quiet_routine,
+    ):
         print(execution_result.summary)
     elif not execution_result:
         summary = telegram_summary(packet, quiet_routine=args.quiet_routine)
