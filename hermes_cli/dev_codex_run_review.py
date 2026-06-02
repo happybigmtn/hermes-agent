@@ -1,8 +1,9 @@
 """Dispatch a Codex-only review pass for a supervised dev run.
 
 Hermes owns orchestration. Codex owns implementation and code review. This
-module prepares the review packet, invokes ``codex exec review``, and stores
-the resulting artifacts without Hermes inventing a merge-readiness verdict.
+module prepares the review packet, invokes ``codex exec`` in a read-only
+sandbox, and stores the resulting artifacts without Hermes inventing a
+merge-readiness verdict.
 """
 
 from __future__ import annotations
@@ -95,24 +96,12 @@ def _run_review_command(
         return CommandResult(tuple(args), 127, "", str(exc))
 
 
-def _review_target_args(
-    *, base: str | None, commit: str | None, title: str | None
-) -> list[str]:
-    if commit:
-        args = ["--commit", commit]
-        if title:
-            args.extend(["--title", title])
-        return args
-    if base:
-        return ["--base", base]
-    return ["--uncommitted"]
-
-
 def build_review_prompt(
     *,
     closeout: CloseoutResult,
     base: str | None,
     commit: str | None,
+    title: str | None = None,
     extra_instructions: str | None = None,
 ) -> str:
     receipt_paths = [
@@ -126,6 +115,22 @@ def build_review_prompt(
         if base
         else "uncommitted changes"
     )
+    review_context = [
+        f"- Repo: {closeout.repo}",
+        f"- Session: {closeout.session}",
+        f"- Target: {target}",
+    ]
+    if title:
+        review_context.append(f"- Title: {title}")
+    review_context.extend(
+        [
+            f"- Closeout artifact: {closeout.markdown_path}",
+            f"- Receipt grade: {closeout.evidence_grade.grade} ({closeout.evidence_grade.reason})",
+            f"- Branch: {closeout.repo_snapshot.branch}",
+            f"- Repo clean: {closeout.repo_snapshot.clean}",
+        ]
+    )
+
     lines = [
         "You are Codex acting only as an independent code reviewer.",
         "",
@@ -142,17 +147,29 @@ def build_review_prompt(
         "Required next action: <one sentence>",
         "",
         "Review context:",
-        f"- Repo: {closeout.repo}",
-        f"- Session: {closeout.session}",
-        f"- Target: {target}",
-        f"- Closeout artifact: {closeout.markdown_path}",
-        f"- Receipt grade: {closeout.evidence_grade.grade} ({closeout.evidence_grade.reason})",
-        f"- Branch: {closeout.repo_snapshot.branch}",
-        f"- Repo clean: {closeout.repo_snapshot.clean}",
+        *review_context,
         "",
         "Machine receipts:",
     ]
     lines.extend(receipt_paths or ["- none"])
+    lines.extend([
+        "",
+        "Target inspection:",
+    ])
+    if commit:
+        lines.append(
+            f"- Inspect the target commit with `git show --stat --patch --find-renames {commit}`."
+        )
+    elif base:
+        lines.append(
+            f"- Inspect the target diff with `git diff --stat {base}...HEAD` "
+            f"and `git diff {base}...HEAD`."
+        )
+    else:
+        lines.append(
+            "- Inspect staged, unstaged, and untracked changes with "
+            "`git status --short` and `git diff`."
+        )
     lines.extend([
         "",
         "Review rules:",
@@ -225,18 +242,13 @@ def run_codex_review(
         closeout=closeout,
         base=base,
         commit=commit,
+        title=title,
         extra_instructions=extra_instructions,
     )
     prompt_path = run_dir / "codex-review-prompt.md"
     output_path = run_dir / "codex-review-output.md"
     prompt_path.write_text(prompt, encoding="utf-8")
-    args = [
-        "codex",
-        "exec",
-        "review",
-        *_review_target_args(base=base, commit=commit, title=title),
-        "-",
-    ]
+    args = ["codex", "exec", "--sandbox", "read-only", "-"]
     command_result = _run_review_command(
         args,
         cwd=repo,

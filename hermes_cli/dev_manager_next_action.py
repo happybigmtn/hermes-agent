@@ -1157,9 +1157,9 @@ def _report_codex_review_result(packet: ManagerPacket) -> SafeExecutionResult:
     )
     return SafeExecutionResult(
         kind=action.kind,
-        ok=_review_returncode(review) == 0,
+        ok=True,
         summary=_review_event_summary(review) + f"\nreported: {report_event.id}",
-        returncode=_review_returncode(review),
+        returncode=0,
     )
 
 

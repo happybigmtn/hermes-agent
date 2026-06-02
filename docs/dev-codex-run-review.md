@@ -4,8 +4,11 @@ The manager role is defined in
 [`dev-orchestrator-manager-contract.md`](dev-orchestrator-manager-contract.md).
 Hermes orchestrates this workflow; Codex produces the code-review verdict.
 
-The helper invokes `codex exec review` with the saved review prompt, so commit
-reviews and uncommitted reviews both use the same structured verdict contract.
+The helper invokes `codex exec --sandbox read-only -` with the saved review
+prompt, so commit reviews and uncommitted reviews both use the same structured
+verdict contract. The prompt tells Codex which commit, base, or uncommitted diff
+to inspect. This avoids the Codex CLI mode where `codex exec review --commit`
+rejects custom stdin prompts.
 
 Use this helper after a supervised Codex/autodev implementation run reaches a
 completion marker, quiet terminal state, or review handoff.
@@ -70,6 +73,11 @@ Each run writes:
 
 The Telegram-ready summary relays Codex's verdict line and confidence line when
 they are present. Hermes should not write or rewrite the verdict.
+
+If Codex returns an attention verdict or command error, Hermes reports that as a
+review result and records `codex-review-report`; the manager tick still exits
+zero after reporting. Cron failure should mean the manager script failed, not
+that Codex found code needing attention.
 
 ## Operator Rule
 

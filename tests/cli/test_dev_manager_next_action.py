@@ -818,3 +818,55 @@ def test_execute_safe_action_reports_completed_codex_review(monkeypatch, tmp_pat
     assert events[0].event_type == "codex-review-report"
     assert events[0].resulting_artifacts == [str(output)]
     assert "reported_event=review" in str(events[0].notes)
+
+
+def test_execute_safe_action_reports_attention_without_cron_failure(monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = tmp_path / "codex-review-output.md"
+    output.write_text(
+        "# Codex Run Review\n\n## Stderr\n\n```text\ncodex review command failed\n```\n",
+        encoding="utf-8",
+    )
+    event_log = tmp_path / "events.jsonl"
+    review = ManagerEvent(
+        id="review",
+        created_at=datetime(2026, 6, 2, 1, 44, tzinfo=timezone.utc),
+        event_type="codex-review",
+        repo=str(repo),
+        worker_session="repo-codex",
+        intent="review",
+        resulting_artifacts=[str(output)],
+        notes="codex review returncode=2",
+    )
+    packet = ManagerPacket(
+        generated_at=now,
+        preflight=_preflight(now),
+        workers=[],
+        boards=[],
+        runs=[],
+        next_action=NextAction(
+            kind="report-codex-review-result",
+            reason="review finished",
+            command="report",
+            repo=str(repo),
+            worker="repo-codex:0.0",
+            review_event_id="review",
+        ),
+    )
+
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.DEFAULT_EVENT_LOG", event_log)
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.matching_events", lambda **kwargs: [review])
+
+    result = execute_safe_action(packet, report_dir=tmp_path / "reports")
+
+    assert result is not None
+    assert result.ok is True
+    assert result.returncode == 0
+    assert "Codex review attention." in result.summary
+    assert "attention: codex review command returned 2" in result.summary
+    events = load_events([event_log])
+    assert len(events) == 1
+    assert events[0].event_type == "codex-review-report"
+    assert "reported_event=review returncode=2" in str(events[0].notes)

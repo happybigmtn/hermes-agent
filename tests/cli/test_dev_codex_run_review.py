@@ -67,7 +67,7 @@ def test_run_codex_review_writes_artifacts_and_records_event(tmp_path, monkeypat
         timeout=123,
     )
 
-    assert captured["args"] == ["codex", "exec", "review", "--uncommitted", "-"]
+    assert captured["args"] == ["codex", "exec", "--sandbox", "read-only", "-"]
     assert captured["cwd"] == repo
     assert captured["timeout"] == 123
     assert "Hermes is the orchestrator" in str(captured["prompt"])
@@ -115,18 +115,11 @@ def test_run_codex_review_can_target_commit_with_title(tmp_path, monkeypatch):
         title="demo commit",
     )
 
-    assert captured["args"] == [
-        "codex",
-        "exec",
-        "review",
-        "--commit",
-        "abc123",
-        "--title",
-        "demo commit",
-        "-",
-    ]
+    assert captured["args"] == ["codex", "exec", "--sandbox", "read-only", "-"]
     assert "Hermes is the orchestrator" in str(captured["prompt"])
     assert "Target: commit abc123" in str(captured["prompt"])
+    assert "Title: demo commit" in str(captured["prompt"])
+    assert "git show --stat --patch --find-renames abc123" in str(captured["prompt"])
 
 
 def test_telegram_summary_relays_native_commit_review_line(tmp_path):
