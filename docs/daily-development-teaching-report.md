@@ -19,6 +19,7 @@ the daily PDF teach in-flight supervised work in addition to landed commits.
 cd /srv/dev/repos/hermes-agent
 install -m 0755 scripts/hermes-daily-dev-report.py ~/.hermes/scripts/daily-dev-report.py
 install -m 0755 scripts/hermes-daily-mastery-check.py ~/.hermes/scripts/daily-mastery-check.py
+install -m 0755 scripts/hermes-daily-mastery-answer.py ~/.hermes/scripts/mastery-check-answer.py
 hermes cron create "0 13 * * *" \
   --name daily-dev-teaching-report \
   --script daily-dev-report.py \
@@ -76,6 +77,18 @@ orchestration run. Later stages remain visible, but the prompt deliberately
 keeps only one current stage active so the teaching loop is incremental instead
 of a single end-of-day quiz.
 
+When the human answers, pipe that answer into:
+
+```bash
+~/.hermes/scripts/mastery-check-answer.py --answer-file -
+```
+
+The answer command writes `daily-mastery-answer-YYYYMMDD-HHMMSS.md`, updates the
+running checklist only when the answer names concrete evidence, syncs the answer
+and checklist to gbrain, and prints a Telegram-ready summary naming the next
+unresolved mastery stage. Vague answers are recorded but do not mark the stage
+complete.
+
 ## Teaching Standard
 
 The report is written for comprehension, not status theater. For every active
@@ -98,6 +111,11 @@ should answer the current stage with concrete repos, branches, commits,
 artifacts, tests, and blockers. Hermes should leave later stages unresolved
 until the current answer is concrete enough to show real understanding.
 
+The answer recorder is intentionally conservative. By default it requires a
+repo or repo path plus at least two other evidence categories such as commit,
+branch, artifact, validation, or risk. Use `--force` only when a human reviewer
+has decided that the answer is sufficient despite the heuristic warning.
+
 ## Manual Verification
 
 ```bash
@@ -106,7 +124,15 @@ python -m hermes_cli.daily_dev_report \
   --lookback-hours 24 \
   --out-dir /tmp/hermes-daily-report \
   --no-gbrain
+
+printf '%s\n' "The problem in happybigmtn/hermes-agent was ... commit 95e420dd1 ... tests passed ..." \
+  | python -m hermes_cli.daily_mastery_answer \
+      --checklist /tmp/hermes-daily-report/HUMAN-UNDERSTANDING-CHECKLIST.md \
+      --out-dir /tmp/hermes-daily-report \
+      --answer-file - \
+      --no-gbrain
 ```
 
 Open the generated PDF and confirm the Telegram summary includes the PDF path as
-a `MEDIA:` tag.
+a `MEDIA:` tag. Then confirm the answer command marks only the first unchecked
+checklist item and leaves the next stage unresolved.
