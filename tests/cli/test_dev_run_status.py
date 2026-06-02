@@ -11,6 +11,7 @@ from hermes_cli.dev_run_status import (
     parse_process_table,
     render_markdown,
     telegram_summary,
+    write_gbrain_page,
 )
 
 
@@ -233,3 +234,22 @@ def test_generate_status_report_writes_markdown_and_summary(tmp_path):
     summary = telegram_summary(result)
     assert "Active runs: 0" in summary
     assert str(result.markdown_path) in summary
+
+
+def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
+    monkeypatch.setattr("hermes_cli.dev_run_status.shutil.which", lambda command: f"/bin/{command}")
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+
+    monkeypatch.setattr("hermes_cli.dev_run_status.subprocess.run", fake_run)
+
+    assert write_gbrain_page("status-slug", "# body") is None
+
+    assert seen["args"][:4] == ["gbrain", "put", "status-slug", "--content"]
+    assert seen["kwargs"]["cwd"] == "/tmp"
+    assert "input" not in seen["kwargs"]
+    assert "Dev Orchestrator Active Run Status" in seen["args"][4]

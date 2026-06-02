@@ -363,10 +363,11 @@ def telegram_summary(result: PreflightResult) -> str:
 def write_gbrain_page(slug: str, markdown: str) -> str | None:
     if not shutil.which("gbrain"):
         return "gbrain binary not found"
+    body = "---\ntype: report\ntitle: Dev Orchestrator Profile Preflight\n---\n\n" + markdown
     try:
         result = subprocess.run(
-            ["gbrain", "put", slug],
-            input=markdown,
+            ["gbrain", "put", slug, "--content", body],
+            cwd="/tmp",
             capture_output=True,
             text=True,
             timeout=30,

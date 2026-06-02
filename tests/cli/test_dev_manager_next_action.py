@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -12,6 +13,7 @@ from hermes_cli.dev_manager_next_action import (
     recommend_next_action,
     render_markdown,
     telegram_summary,
+    write_gbrain_page,
 )
 from hermes_cli.dev_orchestrator_preflight import Check, PreflightResult, ProfilePreflight
 
@@ -123,3 +125,22 @@ def test_next_action_dispatches_highest_priority_ready_task(isolated_kanban_home
     summary = telegram_summary(packet)
     assert "Next: dispatch-task" in summary
     assert "Command:" in summary
+
+
+def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.shutil.which", lambda command: f"/bin/{command}")
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.subprocess.run", fake_run)
+
+    assert write_gbrain_page("next-action-slug", "# next") is None
+
+    assert seen["args"][:4] == ["gbrain", "put", "next-action-slug", "--content"]
+    assert seen["kwargs"]["cwd"] == "/tmp"
+    assert "input" not in seen["kwargs"]
+    assert "Dev Orchestrator Manager Next Action" in seen["args"][4]

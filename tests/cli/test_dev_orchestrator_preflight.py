@@ -13,6 +13,7 @@ from hermes_cli.dev_orchestrator_preflight import (
     render_markdown,
     subprocess_home,
     telegram_summary,
+    write_gbrain_page,
 )
 
 
@@ -155,3 +156,22 @@ def test_generate_preflight_report_writes_markdown(tmp_path, monkeypatch):
     assert result.markdown_path is not None
     assert result.markdown_path.exists()
     assert "reviewer: PASS" in result.markdown_path.read_text(encoding="utf-8")
+
+
+def test_write_gbrain_page_uses_content_arg_and_neutral_cwd(monkeypatch):
+    monkeypatch.setattr("hermes_cli.dev_orchestrator_preflight.shutil.which", lambda command: f"/bin/{command}")
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+
+    monkeypatch.setattr("hermes_cli.dev_orchestrator_preflight.subprocess.run", fake_run)
+
+    assert write_gbrain_page("preflight-slug", "# preflight") is None
+
+    assert seen["args"][:4] == ["gbrain", "put", "preflight-slug", "--content"]
+    assert seen["kwargs"]["cwd"] == "/tmp"
+    assert "input" not in seen["kwargs"]
+    assert "Dev Orchestrator Profile Preflight" in seen["args"][4]

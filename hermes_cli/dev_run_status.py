@@ -588,8 +588,8 @@ def write_gbrain_page(slug: str, markdown: str) -> str | None:
     body = "---\ntype: report\ntitle: Dev Orchestrator Active Run Status\n---\n\n" + markdown
     try:
         result = subprocess.run(
-            ["gbrain", "put", slug],
-            input=body,
+            ["gbrain", "put", slug, "--content", body],
+            cwd="/tmp",
             capture_output=True,
             text=True,
             timeout=30,

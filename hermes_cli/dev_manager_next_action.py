@@ -393,6 +393,7 @@ def write_gbrain_page(slug: str, markdown: str) -> str | None:
     try:
         result = subprocess.run(
             ["gbrain", "put", slug, "--content", body],
+            cwd="/tmp",
             capture_output=True,
             text=True,
             timeout=30,
