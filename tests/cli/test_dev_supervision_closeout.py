@@ -15,6 +15,7 @@ from hermes_cli.dev_supervision_closeout import (
     main,
     telegram_summary,
 )
+from hermes_cli.dev_manager_events import ManagerEvent
 
 
 def _init_repo(path: Path) -> None:
@@ -82,6 +83,22 @@ def test_collect_closeout_writes_report_without_real_tmux_or_gbrain(tmp_path, mo
             None,
         ),
     )
+    monkeypatch.setattr(
+        "hermes_cli.dev_supervision_closeout.matching_events",
+        lambda **kwargs: [
+            ManagerEvent(
+                id="evt1",
+                created_at=datetime(2026, 6, 2, 3, 0, tzinfo=timezone.utc),
+                event_type="worker-start",
+                repo=str(repo),
+                worker_session="ludeme-codex",
+                intent="Run a supervised Ludeme implementation slice.",
+                requested_by="hermes",
+                delivery_channel="telegram",
+                resulting_artifacts=[".auto/orchestrator/ludeme-codex/prompt.md"],
+            )
+        ],
+    )
 
     result = collect_closeout(
         repo=repo,
@@ -97,6 +114,9 @@ def test_collect_closeout_writes_report_without_real_tmux_or_gbrain(tmp_path, mo
     assert "Dev Supervision Closeout" in text
     assert "ludeme-codex:0.0" in text
     assert "Codex working" in text
+    assert "Manager Events" in text
+    assert "Run a supervised Ludeme implementation slice." in text
+    assert ".auto/orchestrator/ludeme-codex/prompt.md" in text
     assert "Steer History" in text
     assert "Supervise repo ludeme session ludeme-codex" in text
     assert "M README.md" in text
@@ -104,6 +124,7 @@ def test_collect_closeout_writes_report_without_real_tmux_or_gbrain(tmp_path, mo
     summary = telegram_summary(result)
     assert "Dev supervision closeout ready." in summary
     assert "worker: ludeme-codex:0.0" in summary
+    assert "manager events: 1" in summary
     assert "steer snippets: 1" in summary
     assert "gbrain:" not in summary
     assert "attention: repo has uncommitted changes" in summary
@@ -149,6 +170,7 @@ def test_main_uses_default_steer_db_paths_when_flag_omitted(tmp_path, monkeypatc
                 recent_artifacts=[],
             ),
             pane_capture_lines=0,
+            manager_events=[],
             steer_history=[],
             steer_history_error=None,
             gbrain_slug=None,

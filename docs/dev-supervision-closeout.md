@@ -8,8 +8,8 @@ deterministic evidence. This complements active-run status:
 
 The command is intentionally no-agent. It captures tmux pane output, repo git
 state, recent commits, recent `.auto` and `gen-*` artifacts, writes a Markdown
-report, attaches matching Hermes transcript snippets, and optionally writes a
-gbrain page.
+report, attaches matching manager events and Hermes transcript snippets, and
+optionally writes a gbrain page.
 
 ## Install
 
@@ -33,6 +33,7 @@ The Telegram-ready summary includes:
 - branch
 - clean/dirty repo state
 - pane capture line count
+- manager-event count
 - steer-history snippet count
 - Markdown report path
 - dashboard URL
@@ -51,6 +52,7 @@ The Markdown report includes:
 - worker target, kind, state, command, and path
 - branch, `git status --short`, recent commits, and diff stat
 - recent `.auto`, `gen-*`, and `genesis` artifacts
+- matching manager events from `~/.hermes/reports/dev-manager-events.jsonl`
 - matching Hermes transcript snippets from root/orchestrator `state.db`
 - captured tmux pane output
 - deterministic manager assessment and next bottleneck
@@ -67,6 +69,28 @@ To add explicit transcript search terms:
 
 Use `--no-steer-history` only when debugging the closeout command itself.
 
+## Manager Event Ledger
+
+Record an explicit manager action before launching or steering a worker:
+
+```bash
+~/.hermes/scripts/dev-manager-events.py record \
+  --repo /srv/dev/repos/nullspaceton \
+  --worker-session nullspaceton-codex \
+  --intent "Run autodev corpus/gen, then execute the queued winner WATER slice." \
+  --artifact .auto/orchestrator/nullspaceton-codex-20260602T033603Z/prompt.md
+```
+
+List recent matching events:
+
+```bash
+~/.hermes/scripts/dev-manager-events.py list \
+  --repo /srv/dev/repos/nullspaceton \
+  --worker-session nullspaceton-codex
+```
+
+The default ledger is `~/.hermes/reports/dev-manager-events.jsonl`.
+
 ## Operator Rule
 
 Run closeout before claiming a supervised interactive worker made progress. A
@@ -76,8 +100,7 @@ whether to continue, steer, review, or commit.
 
 ## Current Gap
 
-The command captures matching transcript snippets, but it does not yet have a
-first-class manager-event registry. The next improvement is to persist explicit
-`worker_session`, `repo`, and `intent` fields when Hermes launches or steers a
-tmux worker so closeout can cite exact manager actions rather than relying on
-transcript search.
+The closeout command can cite explicit manager events, but Hermes gateway and
+tmux launch paths still need to record those events automatically at dispatch
+time. Until that integration is complete, call `dev-manager-events.py record`
+when launching or steering long-running workers.

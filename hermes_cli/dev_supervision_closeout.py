@@ -30,6 +30,12 @@ from hermes_cli.dev_run_status import (
     default_dashboard_url,
     list_tmux_worker_sessions,
 )
+from hermes_cli.dev_manager_events import (
+    DEFAULT_EVENT_LOG,
+    ManagerEvent,
+    matching_events,
+    render_event_line,
+)
 
 
 DEFAULT_CAPTURE_LINES = 220
@@ -87,6 +93,7 @@ class CloseoutResult:
     worker: WorkerSession | None
     repo_snapshot: RepoSnapshot
     pane_capture_lines: int
+    manager_events: list[ManagerEvent]
     steer_history: list[SteerHistoryEntry]
     steer_history_error: str | None
     gbrain_slug: str | None
@@ -316,6 +323,7 @@ def render_markdown(
     generated_at: datetime,
     worker: WorkerSession | None,
     repo_snapshot: RepoSnapshot,
+    manager_events: Sequence[ManagerEvent],
     steer_history: Sequence[SteerHistoryEntry],
     steer_history_error: str | None,
     pane_lines: Sequence[str],
@@ -377,6 +385,23 @@ def render_markdown(
     lines.extend(
         [
             "",
+            "## Manager Events",
+            "",
+            "Source: Hermes manager-event JSONL ledger.",
+            "",
+        ]
+    )
+    if manager_events:
+        for event in manager_events:
+            lines.append(f"- {render_event_line(event)}")
+            if event.resulting_artifacts:
+                artifact_text = ", ".join(f"`{item}`" for item in event.resulting_artifacts)
+                lines.append(f"  Artifacts: {artifact_text}")
+    else:
+        lines.append("- no matching manager events found")
+    lines.extend(
+        [
+            "",
             "## Steer History",
             "",
             "Source: Hermes SessionDB search over user/assistant transcript messages. Tool messages are omitted.",
@@ -419,7 +444,7 @@ def render_markdown(
             "",
             "## Next Bottleneck",
             "",
-            "Hermes still needs automatic steer-history capture. This closeout records pane and repo evidence, but not the Telegram messages that instructed the worker.",
+            "Hermes has a durable manager-event ledger, but gateway/tmux launch paths still need to record events automatically at dispatch time.",
             "",
         ]
     )
@@ -441,6 +466,8 @@ def collect_closeout(
     steer_db_paths: Sequence[Path] | None = None,
     steer_search_terms: Sequence[str] | None = None,
     steer_limit: int = 8,
+    manager_event_paths: Sequence[Path] | None = None,
+    manager_event_limit: int = 8,
 ) -> CloseoutResult:
     repo = repo.expanduser().resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +476,12 @@ def collect_closeout(
     target = worker.target() if worker else session
     pane_lines = capture_pane(target, lines=capture_lines)
     repo_snapshot = collect_repo_snapshot(repo)
+    manager_events = matching_events(
+        repo=repo,
+        worker_session=session,
+        event_logs=manager_event_paths,
+        limit=manager_event_limit,
+    )
     steer_history: list[SteerHistoryEntry] = []
     steer_history_error = None
     if include_steer_history:
@@ -468,6 +501,7 @@ def collect_closeout(
         generated_at=generated_at,
         worker=worker,
         repo_snapshot=repo_snapshot,
+        manager_events=manager_events,
         steer_history=steer_history,
         steer_history_error=steer_history_error,
         pane_lines=pane_lines,
@@ -486,6 +520,7 @@ def collect_closeout(
         worker=worker,
         repo_snapshot=repo_snapshot,
         pane_capture_lines=len(pane_lines),
+        manager_events=manager_events,
         steer_history=steer_history,
         steer_history_error=steer_history_error,
         gbrain_slug=None if gbrain_error or not write_gbrain else slug,
@@ -501,6 +536,7 @@ def telegram_summary(result: CloseoutResult) -> str:
         f"worker: {result.worker.target() if result.worker else 'not found'}",
         f"branch: {result.repo_snapshot.branch}",
         f"clean: {result.repo_snapshot.clean}",
+        f"manager events: {len(result.manager_events)}",
         f"steer snippets: {len(result.steer_history)}",
         f"pane lines: {result.pane_capture_lines}",
         f"report: {result.markdown_path}",
@@ -530,6 +566,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steer-query", action="append", default=[], help="Extra SessionDB search term for steer history")
     parser.add_argument("--steer-db", action="append", default=[], help="SessionDB path to search; defaults to root and orchestrator profile state.db")
     parser.add_argument("--steer-limit", type=int, default=int(os.getenv("HERMES_DEV_SUPERVISION_STEER_LIMIT", "8")))
+    parser.add_argument("--manager-event-log", action="append", default=[], help="Manager event JSONL path; defaults to ~/.hermes/reports/dev-manager-events.jsonl")
+    parser.add_argument("--manager-event-limit", type=int, default=int(os.getenv("HERMES_DEV_MANAGER_EVENT_LIMIT", "8")))
     parser.add_argument("--no-steer-history", action="store_true")
     parser.add_argument("--no-gbrain", action="store_true")
     return parser
@@ -555,6 +593,12 @@ def main(argv: list[str] | None = None) -> int:
         ),
         steer_search_terms=args.steer_query or None,
         steer_limit=args.steer_limit,
+        manager_event_paths=(
+            [Path(item).expanduser() for item in args.manager_event_log]
+            if args.manager_event_log
+            else [DEFAULT_EVENT_LOG]
+        ),
+        manager_event_limit=args.manager_event_limit,
     )
     print(telegram_summary(result))
     return 0
