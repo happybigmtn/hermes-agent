@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -547,6 +548,46 @@ class TestGoalManager:
 
         assert decision["should_continue"] is False
         assert decision["verdict"] == "done"
+
+    def test_manager_goal_checks_specific_cited_repo_auto_artifact(
+        self,
+        hermes_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        repo = tmp_path / "repo"
+        stale_artifact = repo / ".auto" / "logs" / "stale-proof.md"
+        fresh_artifact = repo / ".auto" / "logs" / "fresh-but-not-cited.md"
+        stale_artifact.parent.mkdir(parents=True)
+        evidence_after = datetime.now(timezone.utc) - timedelta(minutes=5)
+        stale_artifact.write_text("stale proof", encoding="utf-8")
+        stale_time = evidence_after.timestamp() - 60
+        os.utime(stale_artifact, (stale_time, stale_time))
+        fresh_artifact.write_text("fresh but not cited", encoding="utf-8")
+        packet = {
+            "generated_at": evidence_after.isoformat(),
+            "next_action": {
+                "kind": "inspect-run-attention",
+                "repo": str(repo),
+                "evidence_after": evidence_after.isoformat(),
+            },
+        }
+        monkeypatch.setattr(goals, "_dev_manager_goal_preflight_enabled", lambda: True)
+        mgr = GoalManager(session_id="manager-specific-auto-receipt")
+        state = mgr.set("keep improving the orchestrator")
+        state.dev_manager_packet = packet
+
+        with patch.object(goals, "judge_goal", return_value=("done", "fresh .auto", False)):
+            decision = mgr.evaluate_after_turn(
+                f"Fresh repo receipt for {repo}: {stale_artifact}"
+            )
+
+        assert decision["should_continue"] is True
+        assert decision["verdict"] == "continue"
+        assert "no fresh machine-verifiable repo" in decision["reason"]
 
     def test_manager_goal_allows_done_with_fresh_git_commit_receipt(
         self,

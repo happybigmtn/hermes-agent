@@ -445,6 +445,8 @@ def _has_fresh_kanban_receipt(*, board: str, task_id: str, evidence_after_epoch:
 
 
 _GIT_COMMIT_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+_AUTO_PATH_RE = re.compile(r"(?P<path>(?:~|/|\.{1,2}/)?[^\s`'\"<>]*\.auto/[^\s`'\"<>]+)")
+_PATH_TRAILING_PUNCT = ".,;:)]}"
 
 
 def _response_cites_repo(response: str, repo_path: Path) -> bool:
@@ -457,27 +459,45 @@ def _response_cites_repo(response: str, repo_path: Path) -> bool:
     return any(candidate and candidate in text for candidate in candidates)
 
 
-def _response_cites_repo_receipt(response: str) -> bool:
-    text = response or ""
-    return ".auto" in text or bool(_GIT_COMMIT_RE.search(text))
+def _cited_auto_artifact_paths(repo_path: Path, response: str) -> list[Path]:
+    auto_root = (repo_path / ".auto").resolve(strict=False)
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for match in _AUTO_PATH_RE.finditer(response or ""):
+        raw = match.group("path").strip().strip("`'\"<>").rstrip(_PATH_TRAILING_PUNCT)
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = repo_path / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved != auto_root and auto_root not in resolved.parents:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(candidate)
+    return paths
 
 
-def _fresh_auto_artifact_exists(repo_path: Path, evidence_after_epoch: int) -> bool:
-    auto_root = repo_path / ".auto"
-    if not auto_root.exists():
-        return False
-    checked = 0
-    for root, dirs, files in os.walk(auto_root):
-        for name in [*dirs, *files]:
-            path = Path(root) / name
-            try:
-                if int(path.stat().st_mtime) >= evidence_after_epoch:
-                    return True
-            except OSError:
-                continue
-            checked += 1
-            if checked >= 20000:
-                return False
+def _response_cites_repo_receipt(response: str, repo_path: Path) -> bool:
+    return bool(_cited_auto_artifact_paths(repo_path, response)) or bool(
+        _GIT_COMMIT_RE.search(response or "")
+    )
+
+
+def _fresh_cited_auto_artifact_exists(
+    repo_path: Path,
+    response: str,
+    evidence_after_epoch: int,
+) -> bool:
+    for path in _cited_auto_artifact_paths(repo_path, response):
+        try:
+            if int(path.stat().st_mtime) >= evidence_after_epoch:
+                return True
+        except OSError:
+            continue
     return False
 
 
@@ -517,8 +537,9 @@ def _has_fresh_repo_receipt(
     response: str,
     evidence_after_epoch: int,
 ) -> bool:
-    if ".auto" in (response or "") and _fresh_auto_artifact_exists(
+    if _fresh_cited_auto_artifact_exists(
         repo_path,
+        response,
         evidence_after_epoch,
     ):
         return True
@@ -577,7 +598,7 @@ def _dev_manager_machine_receipt_failure(
             "dev-manager receipt check failed: response did not cite the "
             f"current repo target `{repo}`"
         )
-    if not _response_cites_repo_receipt(last_response):
+    if not _response_cites_repo_receipt(last_response, repo_path):
         return (
             "dev-manager receipt check failed: response did not cite a "
             f"machine-verifiable repo receipt for `{repo}`; cite a fresh `.auto` "
