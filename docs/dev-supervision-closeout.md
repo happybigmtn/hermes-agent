@@ -8,7 +8,8 @@ deterministic evidence. This complements active-run status:
 
 The command is intentionally no-agent. It captures tmux pane output, repo git
 state, recent commits, recent `.auto` and `gen-*` artifacts, writes a Markdown
-report, and optionally writes a gbrain page.
+report, attaches matching Hermes transcript snippets, and optionally writes a
+gbrain page.
 
 ## Install
 
@@ -32,6 +33,7 @@ The Telegram-ready summary includes:
 - branch
 - clean/dirty repo state
 - pane capture line count
+- steer-history snippet count
 - Markdown report path
 - dashboard URL
 - gbrain slug, when synced
@@ -49,8 +51,21 @@ The Markdown report includes:
 - worker target, kind, state, command, and path
 - branch, `git status --short`, recent commits, and diff stat
 - recent `.auto`, `gen-*`, and `genesis` artifacts
+- matching Hermes transcript snippets from root/orchestrator `state.db`
 - captured tmux pane output
 - deterministic manager assessment and next bottleneck
+
+To add explicit transcript search terms:
+
+```bash
+~/.hermes/scripts/dev-supervision-closeout.py \
+  --repo /srv/dev/repos/nullspaceton \
+  --session nullspaceton-codex \
+  --steer-query "WATER-001" \
+  --steer-query "dev orchestrator"
+```
+
+Use `--no-steer-history` only when debugging the closeout command itself.
 
 ## Operator Rule
 
@@ -61,7 +76,8 @@ whether to continue, steer, review, or commit.
 
 ## Current Gap
 
-The command captures pane and repo evidence, but it does not yet capture Hermes
-Telegram steer history. The next improvement is to attach gateway steer events
-to the closeout so gbrain remembers not only what the worker did, but what the
-manager asked it to do.
+The command captures matching transcript snippets, but it does not yet have a
+first-class manager-event registry. The next improvement is to persist explicit
+`worker_session`, `repo`, and `intent` fields when Hermes launches or steers a
+tmux worker so closeout can cite exact manager actions rather than relying on
+transcript search.
