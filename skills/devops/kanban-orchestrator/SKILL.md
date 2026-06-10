@@ -211,3 +211,45 @@ When a worker profile keeps crashing, hallucinating, or getting blocked by its o
 3. **Change profile model** — the dashboard prints a copy-paste hint for `hermes -p <profile> model` since profile config lives on disk; edit it in a terminal, then Reclaim to retry with the new model.
 
 Hallucination warnings appear on tasks where a worker's `kanban_complete(created_cards=[...])` claim included card ids that don't exist or weren't created by the worker's profile (the gate blocks the completion), or where the free-form summary references `t_<hex>` ids that don't resolve (advisory prose scan, non-blocking). Both produce audit events that persist even after recovery actions — the trail stays for debugging.
+
+## Brief discipline for repo execution boards (recurring campaign cards)
+
+Hard-won rules from a 7-day board audit (worker-hours burned on timeouts
+outnumbered completed-task hours ~3:1). These bind any orchestrator that
+generates recurring execution cards ("ship the top priority for <repo>")
+against a plan file like `IMPLEMENTATION_PLAN.md`:
+
+1. **Derive priority at dispatch time, never at creation time.** Plan
+   checkboxes rot — rows stay `- [ ]` long after the work landed. Do not
+   bake a task row into a card title ("SHIP TASK-216 ...") from a stale
+   read. Before naming a row, verify it is genuinely open NOW: check
+   `git log --oneline` for the row's deliverable and run the repo's own
+   reconciliation guards (e.g. `scripts/check-receipt-drift.sh`,
+   `check-uncommitted-claimed-shipped.sh`) when they exist. If you can't
+   verify, write the card goal as "the highest-priority genuinely-open
+   item per the verified planning surface" and make verification the
+   worker's first step.
+
+2. **Throttle creation to queue capacity.** Repo boards execute one card
+   at a time. Creating cards on a timer while the board already has
+   `ready` work just churns the queue (observed: 318 created / 92 done /
+   223 archived in 7 days). Before `kanban_create`, run
+   `kanban_list(status="ready")` + `kanban_list(status="running")` for
+   the board; if either is non-empty, do NOT create another execution
+   card — improve/verify the existing ones instead.
+
+3. **Size slices to the iteration budget, and require incremental
+   commits.** A worker gets a bounded iteration budget per attempt; a
+   "land it as one coherent change" rule on a >1h slice guarantees the
+   timeout loses everything. Every execution brief must instruct:
+   *commit each green sub-step to the working branch as you go*. For
+   slices you cannot confidently bound under ~1 hour, create the card
+   with `goal_mode=True` (same-session continuation with a judge)
+   instead of relying on respawn-and-retry.
+
+4. **Honor rescued WIP.** When a card body contains a
+   `## RESCUED WIP (auto-generated)` section, the dispatcher preserved a
+   failed attempt's uncommitted tree on the named `kanban-rescue/<id>`
+   branch. The task is now *finish-from-WIP*: inspect, restore, verify,
+   complete. Never instruct (or allow) a from-scratch redo, and never
+   delete rescue branches.

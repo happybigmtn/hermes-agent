@@ -190,3 +190,23 @@ Every tool has a CLI equivalent for human operators and scripts:
 - etc.
 
 Use the tools from inside an agent; the CLI exists for the human at the terminal.
+
+## Execution-board startup checks (repo workspaces)
+
+Two checks before doing any work on a `dir:` repo workspace:
+
+1. **Verify the named priority is still open.** Card titles that name a
+   plan row ("SHIP TASK-NNN ...") are written at creation time and rot:
+   the row may already be done with a stale checkbox. Check
+   `git log --oneline -20` and the repo's reconciliation guards before
+   implementing. If the named row already landed, pick the highest
+   genuinely-open item from the planning surface instead — and say so in
+   your completion summary so the plan gets reconciled.
+
+2. **Check for rescued WIP.** If the card body has a
+   `## RESCUED WIP (auto-generated)` section, a previous attempt's
+   uncommitted work is preserved on the named `kanban-rescue/<task_id>`
+   branch. Start from it (`git diff HEAD <branch>`, restore what is
+   sound, verify, finish) — never from scratch, and never delete the
+   branch. Commit each green sub-step as you go so a timeout can't lose
+   your work either.
