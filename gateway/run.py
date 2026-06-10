@@ -5707,6 +5707,24 @@ class GatewayRunner:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
+        # Board-level crash circuit breaker: pause a board after N
+        # consecutive crashed runs (systemic failure — dead auth, broken
+        # worker binary). 0 disables. See check_board_crash_breaker.
+        raw_crash_pause = kanban_cfg.get(
+            "board_crash_pause_threshold",
+            _kb.DEFAULT_BOARD_CRASH_PAUSE_THRESHOLD,
+        )
+        try:
+            crash_pause_threshold = int(raw_crash_pause or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid "
+                "kanban.board_crash_pause_threshold=%r; using default %d",
+                raw_crash_pause,
+                _kb.DEFAULT_BOARD_CRASH_PAUSE_THRESHOLD,
+            )
+            crash_pause_threshold = _kb.DEFAULT_BOARD_CRASH_PAUSE_THRESHOLD
+
         # Read stale_timeout_seconds — 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
         try:
@@ -5855,6 +5873,7 @@ class GatewayRunner:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    crash_pause_threshold=crash_pause_threshold,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

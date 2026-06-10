@@ -301,6 +301,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_pause = boards_sub.add_parser(
+        "pause",
+        help="Pause dispatch on a board (reclaim/timeout bookkeeping "
+             "keeps running; no new workers spawn until resume)",
+    )
+    b_pause.add_argument("slug")
+    b_pause.add_argument("reason", nargs="*",
+                         help="Optional reason recorded in board.json")
+
+    b_resume = boards_sub.add_parser(
+        "resume",
+        help="Resume dispatch on a paused board",
+    )
+    b_resume.add_argument("slug")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -1029,8 +1044,30 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "pause":
+        return _cmd_boards_pause(args)
+    if sub == "resume":
+        return _cmd_boards_resume(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
+
+
+def _cmd_boards_pause(args: argparse.Namespace) -> int:
+    slug = args.slug
+    reason_words = getattr(args, "reason", None) or []
+    reason = " ".join(reason_words).strip() or "paused by operator"
+    meta = kb.write_board_metadata(slug, paused=True, paused_reason=reason)
+    print(f"Paused board {meta['slug']}: {reason}")
+    print("Dispatch skips this board until "
+          f"`hermes kanban boards resume {meta['slug']}`.")
+    return 0
+
+
+def _cmd_boards_resume(args: argparse.Namespace) -> int:
+    slug = args.slug
+    meta = kb.write_board_metadata(slug, paused=False)
+    print(f"Resumed board {meta['slug']} — dispatch re-enabled.")
+    return 0
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
@@ -1075,6 +1112,8 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
+        if b.get("paused"):
+            name += " [PAUSED]"
         print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
     print()
     print(f"Current board: {current}")

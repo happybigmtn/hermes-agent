@@ -497,6 +497,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         "created_at": None,
         "archived": False,
+        "paused": False,
+        "paused_reason": None,
     }
     try:
         p = board_metadata_path(slug)
@@ -522,6 +524,8 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    paused: Optional[bool] = None,
+    paused_reason: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -545,6 +549,12 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if paused is not None:
+        meta["paused"] = bool(paused)
+        if not paused:
+            meta["paused_reason"] = None
+    if paused_reason is not None:
+        meta["paused_reason"] = str(paused_reason)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -4722,6 +4732,10 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
+    board_paused: bool = False
+    """True when the board is paused (operator or circuit breaker) and
+    this tick deliberately spawned nothing. Reclaim/timeout bookkeeping
+    still ran."""
     reclaimed: int = 0
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
@@ -5428,6 +5442,151 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+# Marker for the auto-generated finish-from-WIP section appended to a
+# task body after a rescue. Replaced in place on subsequent rescues so
+# the body never accumulates stale sections.
+_RESCUE_SECTION_MARKER = "## RESCUED WIP (auto-generated)"
+
+# Untracked build/dependency dirs excluded from rescue commits. A failed
+# Rust/Node worker can leave gigabytes of build output untracked in a
+# shared dir workspace; staging it would bloat the rescue branch.
+_RESCUE_EXCLUDE_PATHSPECS = (
+    ":(exclude)target",
+    ":(exclude)node_modules",
+    ":(exclude).venv",
+    ":(exclude)dist",
+    ":(exclude)build",
+)
+
+
+def _rescue_workspace_wip(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str,
+) -> Optional[str]:
+    """Preserve a failed worker's uncommitted tree on a rescue branch.
+
+    Best-effort and never raises: any git/IO error degrades to a
+    ``wip_rescue_failed`` event instead of disturbing the failure
+    bookkeeping that called us.
+
+    For ``dir:`` workspaces only (worktree workspaces are already
+    isolated per task; scratch workspaces have no repo). When the
+    workspace is a git repo with uncommitted changes:
+
+    1. Stage everything except build dirs, snapshot via
+       ``write-tree``/``commit-tree`` (HEAD and the working files are
+       never moved — the next worker's tree reset can no longer destroy
+       the work), and force-point ``kanban-rescue/<task_id>`` at it.
+    2. Rewrite the task body's rescue section so the *next* attempt is
+       a finish-from-WIP brief instead of a verbatim retry.
+    3. Emit a ``wip_rescued`` event with the branch and diffstat.
+
+    Returns the rescue branch name, or None when there was nothing to
+    rescue.
+    """
+    branch = f"kanban-rescue/{task_id}"
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path, body "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or (row["workspace_kind"] or "") != "dir":
+            return None
+        workspace = row["workspace_path"] or ""
+        if not workspace or not os.path.isdir(workspace):
+            return None
+
+        def _git(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", workspace, *args],
+                capture_output=True, text=True, timeout=timeout,
+            )
+
+        inside = _git("rev-parse", "--is-inside-work-tree")
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        head = _git("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return None
+        head_sha = head.stdout.strip()
+        dirty = _git("status", "--porcelain", "--", ".", *_RESCUE_EXCLUDE_PATHSPECS)
+        if dirty.returncode != 0 or not dirty.stdout.strip():
+            return None
+
+        # Snapshot without moving HEAD or the working files: stage into
+        # the index, write the tree object, hang a commit off HEAD, then
+        # restore the index so the workspace looks untouched.
+        if _git("add", "-A", "--", ".", *_RESCUE_EXCLUDE_PATHSPECS,
+                timeout=120).returncode != 0:
+            return None
+        try:
+            diffstat = _git("diff", "--cached", "--stat", "HEAD")
+            tree = _git("write-tree")
+            if tree.returncode != 0:
+                return None
+            commit = _git(
+                "-c", "user.name=hermes-kanban-rescue",
+                "-c", "user.email=kanban-rescue@localhost",
+                "commit-tree", tree.stdout.strip(), "-p", head_sha,
+                "-m", f"kanban rescue: {task_id} ({outcome}) — "
+                      "uncommitted worker WIP preserved by the dispatcher",
+            )
+            if commit.returncode != 0:
+                return None
+            if _git("branch", "-f", branch, commit.stdout.strip()).returncode != 0:
+                return None
+        finally:
+            _git("reset", "-q")
+
+        stat_text = (diffstat.stdout or "").strip()[:1500]
+        section = (
+            f"\n\n---\n{_RESCUE_SECTION_MARKER}\n"
+            f"The previous attempt ({outcome}) left uncommitted work, now "
+            f"preserved on branch `{branch}` (parent `{head_sha[:10]}`).\n"
+            f"Diffstat:\n```\n{stat_text}\n```\n"
+            "DO NOT START FROM SCRATCH. First inspect the rescued work "
+            f"(`git diff HEAD {branch}`), restore what is sound "
+            f"(`git checkout {branch} -- <paths>` or cherry-pick), verify "
+            "build/tests, then finish ONLY the remaining acceptance "
+            "criteria and commit. Commit each green sub-step as you go. "
+            f"Never delete `{branch}`.\n"
+        )
+        with write_txn(conn):
+            body_row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            body = (body_row["body"] or "") if body_row else ""
+            marker_at = body.find(f"---\n{_RESCUE_SECTION_MARKER}")
+            if marker_at != -1:
+                body = body[:marker_at].rstrip()
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (body + section, task_id),
+            )
+            _append_event(
+                conn, task_id, "wip_rescued",
+                {
+                    "branch": branch,
+                    "parent": head_sha,
+                    "outcome": outcome,
+                    "diffstat": stat_text[:500],
+                },
+            )
+        return branch
+    except Exception as exc:  # pragma: no cover - defensive
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "wip_rescue_failed",
+                    {"error": str(exc)[:300], "outcome": outcome},
+                )
+        except Exception:
+            pass
+        return None
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5475,6 +5634,14 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    # Preserve uncommitted worker WIP before any retry/give-up
+    # bookkeeping: the rescue rewrites the task body into a
+    # finish-from-WIP brief, so a retry is never a verbatim re-run of a
+    # brief that already failed, and a tree reset by the next worker
+    # can't destroy the work. Spawn failures are excluded — no worker
+    # ran, so there is nothing to rescue.
+    if outcome in ("timed_out", "crashed"):
+        _rescue_workspace_wip(conn, task_id, outcome=outcome)
     blocked = False
     with write_txn(conn):
         row = conn.execute(
@@ -5769,6 +5936,70 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+# Default for the board-level crash circuit breaker: pause dispatch on a
+# board after this many consecutive crashed runs. Distinct from the
+# per-task ``DEFAULT_FAILURE_LIMIT``: per-task limits catch one bad
+# task; this catches a systemically broken board (dead auth, broken
+# profile, missing binary) where every spawned worker crashes and the
+# board otherwise burns workers for days. Gateways override via the
+# ``kanban.board_crash_pause_threshold`` config; 0/None disables.
+DEFAULT_BOARD_CRASH_PAUSE_THRESHOLD = 8
+
+
+def check_board_crash_breaker(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    *,
+    threshold: int = DEFAULT_BOARD_CRASH_PAUSE_THRESHOLD,
+) -> bool:
+    """Pause the board when its last ``threshold`` runs ALL crashed.
+
+    Looks at finished runs across the whole board (not per task): a
+    crash storm with a systemic cause (dead credentials, broken worker
+    binary) shows up as an unbroken run of ``crashed`` outcomes across
+    many tasks, each individually below its per-task failure limit.
+
+    Trips at most once: a board already paused is left alone, and any
+    non-crash outcome in the window resets the streak naturally.
+    Returns True when the breaker tripped during *this* call. Emits a
+    ``board_paused`` event on the most recently crashed task and logs a
+    warning so the operator sees it without watching the board.
+    """
+    if threshold <= 0:
+        return False
+    rows = conn.execute(
+        "SELECT task_id, outcome FROM task_runs "
+        "WHERE ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT ?",
+        (threshold,),
+    ).fetchall()
+    if len(rows) < threshold:
+        return False
+    if any((r["outcome"] or "") != "crashed" for r in rows):
+        return False
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    reason = (
+        f"circuit breaker: last {threshold} runs on this board all "
+        f"crashed — paused at {int(time.time())} pending operator "
+        "review. Inspect worker logs, fix the systemic cause, then "
+        f"`hermes kanban boards resume {slug}`."
+    )
+    write_board_metadata(slug, paused=True, paused_reason=reason)
+    logging.getLogger(__name__).warning(
+        "kanban: board %s paused by crash circuit breaker "
+        "(%d consecutive crashed runs)", slug, threshold,
+    )
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, rows[0]["task_id"], "board_paused",
+                {"board": slug, "threshold": threshold, "reason": reason},
+            )
+    except Exception:  # pragma: no cover - event is advisory
+        pass
+    return True
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -5782,6 +6013,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    crash_pause_threshold: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -5831,6 +6063,21 @@ def dispatch_once(
         result.auto_blocked.extend(_crash_auto_blocked)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Board-level controls. A paused board (operator pause or tripped
+    # crash circuit breaker) keeps all the bookkeeping above — reclaims,
+    # crash/timeout detection, promotions — but spawns nothing, so a
+    # crash storm can't burn workers and an operator can own the
+    # workspace dir without racing the fleet.
+    board_meta = read_board_metadata(board)
+    if not board_meta.get("paused") and crash_pause_threshold:
+        if check_board_crash_breaker(
+            conn, board, threshold=int(crash_pause_threshold),
+        ):
+            board_meta = read_board_metadata(board)
+    if board_meta.get("paused"):
+        result.board_paused = True
+        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
