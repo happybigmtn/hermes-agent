@@ -162,6 +162,31 @@ def test_rescue_skips_scratch_and_spawn_failures(kanban_home, workspace_repo):
                     f"kanban-rescue/{tid}").returncode != 0
 
 
+def test_rescue_skips_repo_with_no_commits(kanban_home, tmp_path):
+    # A git repo with uncommitted work but no HEAD yet (zero commits):
+    # `rev-parse HEAD` fails, so there is no parent to hang the rescue
+    # commit off. The rescue must degrade silently — no branch, no event,
+    # body untouched, and crucially no exception into the failure path.
+    repo = tmp_path / "fresh_repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@localhost")
+    (repo / "wip.py").write_text("x = 1\n")
+    with kb.connect() as conn:
+        tid = _make_dir_task(conn, repo, body="original brief")
+        kb._record_task_failure(
+            conn, tid, "boom", outcome="crashed", failure_limit=5,
+        )
+        assert _git(repo, "rev-parse", "--verify",
+                    f"kanban-rescue/{tid}").returncode != 0
+        assert not [
+            e for e in kb.list_events(conn, tid)
+            if e.kind in ("wip_rescued", "wip_rescue_failed")
+        ]
+        assert kb.get_task(conn, tid).body == "original brief"
+
+
 # ---------------------------------------------------------------------------
 # Board crash circuit breaker
 # ---------------------------------------------------------------------------
