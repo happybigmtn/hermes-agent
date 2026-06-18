@@ -127,7 +127,12 @@ class SubdirectoryHintTracker:
         ``project/src/`` has no hint files of its own.
         """
         try:
-            p = Path(raw_path).expanduser()
+            try:
+                p = Path(raw_path).expanduser()
+            except (RuntimeError, ValueError):
+                # $HOME unset / un-resolvable ~path: skip expansion rather
+                # than raising into the agent tool-call loop (incident 2026-06-03).
+                p = Path(raw_path)
             if not p.is_absolute():
                 p = self.working_dir / p
             p = p.resolve()

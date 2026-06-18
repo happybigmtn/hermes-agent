@@ -1198,3 +1198,83 @@ def test_execute_safe_action_dispatches_review_repair_to_worker(monkeypatch, tmp
     assert "Codex review `review` returned `FIX_FIRST`" in captured["message"]
     assert str(output) in captured["message"]
     assert "Do not ask the human" in captured["message"]
+
+
+def test_execute_safe_action_dispatches_kanban_task(monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    packet = ManagerPacket(
+        generated_at=now,
+        preflight=_preflight(now),
+        workers=[],
+        boards=[],
+        runs=[],
+        next_action=NextAction(
+            kind="dispatch-task",
+            reason="ready task is highest priority",
+            command="hermes kanban --board ludeme dispatch",
+            board="ludeme",
+            task_id="t_ready",
+        ),
+    )
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            '{"spawned":[{"task_id":"t_ready","assignee":"default","workspace":"/tmp/work"}]}',
+            "",
+        )
+
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.subprocess.run", fake_run)
+
+    result = execute_safe_action(packet, report_dir=tmp_path / "reports")
+
+    assert result is not None
+    assert result.ok is True
+    assert result.notify is False
+    assert captured["args"][2:] == [
+        "hermes_cli.main",
+        "kanban",
+        "--board",
+        "ludeme",
+        "dispatch",
+        "--max",
+        "1",
+        "--json",
+    ]
+    assert "t_ready -> default @ /tmp/work" in result.summary
+
+
+def test_execute_safe_action_reports_kanban_dispatch_no_spawn(monkeypatch, tmp_path):
+    now = datetime(2026, 6, 2, 1, 45, tzinfo=timezone.utc)
+    packet = ManagerPacket(
+        generated_at=now,
+        preflight=_preflight(now),
+        workers=[],
+        boards=[],
+        runs=[],
+        next_action=NextAction(
+            kind="run-review",
+            reason="review task is ready",
+            command="hermes kanban --board ludeme dispatch",
+            board="ludeme",
+            task_id="t_review",
+        ),
+    )
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, '{"spawned":[],"skipped_unassigned":["t_review"]}', "")
+
+    monkeypatch.setattr("hermes_cli.dev_manager_next_action.subprocess.run", fake_run)
+
+    result = execute_safe_action(packet, report_dir=tmp_path / "reports")
+
+    assert result is not None
+    assert result.ok is False
+    assert result.notify is True
+    assert result.returncode == 1
+    assert "spawned no worker" in result.summary
+    assert "skipped_unassigned" in result.summary

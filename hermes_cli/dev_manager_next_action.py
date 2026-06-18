@@ -1364,12 +1364,93 @@ def _dispatch_review_repair(packet: ManagerPacket) -> SafeExecutionResult:
     )
 
 
+def _dispatch_kanban_action(packet: ManagerPacket) -> SafeExecutionResult:
+    action = packet.next_action
+    if not action.board:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"{action.kind} failed: missing Kanban board",
+            returncode=1,
+        )
+    command = [
+        sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "kanban",
+        "--board",
+        action.board,
+        "dispatch",
+        "--max",
+        "1",
+        "--json",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"{action.kind} failed before Kanban dispatch completed: {exc}",
+            returncode=127,
+        )
+    detail = (result.stdout or result.stderr or "").strip()
+    spawned: list[dict[str, object]] = []
+    try:
+        parsed = json.loads(result.stdout or "{}")
+        raw_spawned = parsed.get("spawned") if isinstance(parsed, dict) else None
+        if isinstance(raw_spawned, list):
+            spawned = [item for item in raw_spawned if isinstance(item, dict)]
+    except json.JSONDecodeError:
+        pass
+    if result.returncode != 0:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=f"{action.kind} Kanban dispatch returned {result.returncode}: {detail[:500]}",
+            returncode=result.returncode,
+        )
+    if not spawned:
+        return SafeExecutionResult(
+            kind=action.kind,
+            ok=False,
+            summary=(
+                f"{action.kind} ran Kanban dispatch on `{action.board}` but spawned no worker. "
+                f"Dispatcher output: {detail[:500] or '(empty)'}"
+            ),
+            returncode=1,
+        )
+    lines = [
+        f"{action.kind} dispatched Kanban worker(s).",
+        f"board: {action.board}",
+    ]
+    for item in spawned:
+        task_id = item.get("task_id") or "unknown"
+        assignee = item.get("assignee") or "unknown"
+        workspace = item.get("workspace") or "-"
+        lines.append(f"- {task_id} -> {assignee} @ {workspace}")
+    return SafeExecutionResult(
+        kind=action.kind,
+        ok=True,
+        summary="\n".join(lines),
+        notify=False,
+    )
+
+
 def execute_safe_action(packet: ManagerPacket, *, report_dir: Path) -> SafeExecutionResult | None:
     action = packet.next_action
     if action.kind == "report-codex-review-result":
         return _report_codex_review_result(packet)
     if action.kind == "repair-codex-review-blocker":
         return _dispatch_review_repair(packet)
+    if action.kind in {"dispatch-task", "run-review"}:
+        return _dispatch_kanban_action(packet)
     if action.kind != "codex-review-worker" or not action.repo or not action.worker:
         return None
     return _dispatch_codex_review(packet, report_dir=report_dir)
